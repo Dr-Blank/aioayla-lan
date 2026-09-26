@@ -1,0 +1,56 @@
+"""Exceptions raised by aioayla_lan."""
+
+
+class AylaLanError(Exception):
+    """Base class for all aioayla_lan errors."""
+
+
+class SignatureError(AylaLanError):
+    """A payload failed HMAC validation."""
+
+
+class NoSessionError(AylaLanError):
+    """An encrypted payload arrived before a key exchange."""
+
+
+class KeyIdMismatchError(AylaLanError):
+    """The device offered a LAN key other than the one we hold."""
+
+
+class CannotConnectError(AylaLanError):
+    """The device did not answer on the LAN."""
+
+
+class NoCallbackError(AylaLanError):
+    """The device accepted registration but never dialled back."""
+
+
+class CallbackRejectedError(NoCallbackError):
+    """The device refused to dial the callback address, e.g. another subnet."""
+
+
+class InvalidKeyError(AylaLanError):
+    """The device dialled back but the LAN key did not authenticate it."""
+
+
+class WriteError(AylaLanError):
+    """A property write was not confirmed by the device."""
+
+
+class WriteExpiredError(WriteError):
+    """The device did not collect a queued write in time, so it was dropped."""
+
+
+class WriteRejectedError(WriteError):
+    """The device collected a write but did not acknowledge it.
+
+    Firmware drops unknown names and out-of-range values without a word.
+    """
+
+
+class CloudAuthError(AylaLanError):
+    """Cloud sign-in was rejected."""
+
+
+class CloudError(AylaLanError):
+    """Any other failure talking to the Ayla cloud."""

@@ -1,0 +1,55 @@
+[project]
+name = "aioayla-lan"
+version = "0.1.0"
+description = "Async local control of Ayla Networks IoT modules over Ayla LAN mode"
+authors = [
+    { name = "Dr-Blank", email = "64108942+Dr-Blank@users.noreply.github.com" },
+]
+requires-python = ">=3.12"
+readme = "README.md"
+license = "Apache-2.0"
+keywords = ["ayla", "ayla networks", "lan mode", "local control", "home assistant"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Topic :: Home Automation",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+dependencies = ["aiohttp>=3.9", "cryptography>=42"]
+
+[project.urls]
+Homepage = "https://github.com/Dr-Blank/aioayla-lan"
+Repository = "https://github.com/Dr-Blank/aioayla-lan"
+Issues = "https://github.com/Dr-Blank/aioayla-lan/issues"
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "ruff",
+    "mypy",
+    "prek",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/aioayla_lan"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/aioayla_lan", "tests", "README.md", "LICENSE"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.mypy]
+strict = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
