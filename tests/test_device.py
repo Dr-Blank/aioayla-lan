@@ -1,11 +1,16 @@
 """AylaLanDevice session handling, command queue and registration loop."""
 
 import asyncio
+import base64
+import hashlib
+import hmac
 import itertools
+import json
+import logging
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
 from contextlib import AbstractContextManager, nullcontext
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import aiohttp
 import pytest
@@ -37,6 +42,7 @@ from aioayla_lan import (
     WriteExpiredError,
     WriteRejectedError,
 )
+from aioayla_lan.crypto import zero_pad
 from aioayla_lan.device import REJECTED_KEY_EXCHANGES, RETRY_INTERVAL, WRITE_TTL
 
 START = 1000.0
@@ -485,16 +491,64 @@ def test_handle_datapoint_reports_value(
         pytest.param({"seq_no": 0, "data": {"value": 1}}, id="data-without-name"),
         pytest.param({"seq_no": 0, "data": {}}, id="empty-data"),
         pytest.param({"seq_no": 0}, id="no-data"),
+        pytest.param({"seq_no": 0, "data": "power"}, id="data-not-an-object"),
+        pytest.param([{"name": "power"}], id="not-an-object"),
     ],
 )
 def test_handle_datapoint_ignores_update_without_name(
     device: AylaLanDevice,
     mirror: SessionCrypto,
     datapoints: list[Datapoint],
-    update: dict[str, Any],
+    update: object,
 ) -> None:
     device.handle_datapoint(mirror.encrypt_and_sign(update))
     assert datapoints == []
+
+
+def test_handle_datapoint_logs_undecodable_payload(
+    device: AylaLanDevice,
+    mirror: SessionCrypto,
+    datapoints: list[Datapoint],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    text = '{"seq_no":1 "data":{}}'
+    with patch.object(json, "dumps", return_value=text):
+        payload = mirror.encrypt_and_sign(None)
+    caplog.set_level(logging.DEBUG, logger="aioayla_lan")
+
+    with pytest.raises(json.JSONDecodeError):
+        device.handle_datapoint(payload)
+
+    assert datapoints == []
+    # Only the plaintext is logged, never the payload or session material.
+    assert caplog.messages == [f"{DSN}: undecodable payload: {text!r}"]
+
+
+def _sign_raw(mirror: SessionCrypto, text: bytes) -> dict[str, str]:
+    """Encrypt and sign plaintext that `json.dumps` cannot produce."""
+    direction = mirror._app
+    return {
+        "enc": base64.b64encode(direction.encryptor.update(zero_pad(text))).decode(),
+        "sign": base64.b64encode(
+            hmac.new(direction.sign_key, text, hashlib.sha256).digest()
+        ).decode(),
+    }
+
+
+def test_handle_datapoint_logs_non_utf8_payload(
+    device: AylaLanDevice,
+    mirror: SessionCrypto,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A Latin-1 degree sign, as firmware might put in a free-text property.
+    text = b'{"seq_no":0,"data":{"name":"device_name","value":"20\xb0C"}}'
+    payload = _sign_raw(mirror, text)
+    caplog.set_level(logging.DEBUG, logger="aioayla_lan")
+
+    with pytest.raises(UnicodeDecodeError):
+        device.handle_datapoint(payload)
+
+    assert caplog.messages == [f"{DSN}: undecodable payload: {text!r}"]
 
 
 async def _queue_async_write(
@@ -573,6 +627,58 @@ async def test_cancelled_caller_leaves_no_timer(
 
     assert armed[0].timer is None
     assert device._unacked == {}
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        pytest.param("power", id="same-name"),
+        pytest.param("mode", id="other-name"),
+    ],
+)
+async def test_cancelled_caller_leaves_other_callers_armed(
+    device: AylaLanDevice, mirror: SessionCrypto, name: str
+) -> None:
+    first = await _queue_async_write(device, "power", 1)
+    second = await _queue_async_write(device, name, 0)
+
+    second.cancel()
+    await asyncio.sleep(0)
+
+    assert second.cancelled()
+    assert device._writes["power"].timer is not None
+    device.handle_datapoint(_ack(mirror, _written(device, mirror)["id"]))
+    await asyncio.wait_for(first, 1)
+
+
+@pytest.mark.parametrize(
+    ("queue", "pending_since"),
+    [
+        pytest.param(lambda d: None, None, id="nothing-else"),
+        pytest.param(
+            lambda d: d.request_properties(["fan_speed"]), START, id="reads-wait"
+        ),
+    ],
+)
+async def test_expired_write_clears_pending_since_unless_reads_wait(
+    clock: _Clock,
+    http: MagicMock,
+    datapoints: list[Datapoint],
+    monkeypatch: pytest.MonkeyPatch,
+    queue: Callable[[AylaLanDevice], None],
+    pending_since: float | None,
+) -> None:
+    """An expired write must not leave the queue looking stuck, nor hide reads."""
+    monkeypatch.setattr("aioayla_lan.device.WRITE_TTL", 0.01)
+    device = _plain_device(http, datapoints)
+    write = await _queue_async_write(device)
+    queue(device)
+
+    with pytest.raises(WriteExpiredError):
+        await asyncio.wait_for(write, 1)
+
+    assert device.pending_since == pending_since
+    assert device.pending is (pending_since is not None)
 
 
 async def test_async_set_property_expired_at_collection(
@@ -1090,6 +1196,50 @@ async def test_run_failure_without_session_does_not_report(
     device.set_property("power", 1)
     assert (await fake_http.next_call()).method == "POST"
     assert connection_changes == []
+
+
+@pytest.mark.parametrize("error", TRANSIENT_ERRORS)
+async def test_run_failure_before_key_exchange_keeps_registration(
+    runner: Callable[[], AylaLanDevice],
+    fake_http: _FakeHttp,
+    connection_changes: list[bool],
+    monkeypatch: pytest.MonkeyPatch,
+    error: BaseException,
+) -> None:
+    """A fresh registration outlives one lost heartbeat, even with no session yet."""
+    monkeypatch.setattr("aioayla_lan.device.HEARTBEAT_INTERVAL", 0.1)
+    device = runner()
+    await fake_http.next_call()
+    fake_http.errors.append(error)
+    device.set_property("power", 1)
+
+    failed = await fake_http.next_call()
+    retry = await fake_http.next_call()
+
+    assert [(c.method, c.notify) for c in (failed, retry)] == [("PUT", 1)] * 2
+    assert retry.at - failed.at >= 0.1 - SLACK
+    assert connection_changes == []
+
+
+async def test_run_drops_session_without_connection_callback(
+    fake_http: _FakeHttp, datapoints: list[Datapoint], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("aioayla_lan.device.HEARTBEAT_INTERVAL", 0.1)
+    monkeypatch.setattr("aioayla_lan.device.SESSION_TIMEOUT", 0.05)
+    monkeypatch.setattr("aioayla_lan.device.RETRY_INTERVAL", 0.01)
+    device = _plain_device(fake_http, datapoints)  # type: ignore[arg-type]
+    task = asyncio.create_task(device.run())
+    await fake_http.next_call()
+    device.handle_key_exchange(key_exchange_request())
+    fake_http.failing["PUT"] = aiohttp.ClientConnectionError("refused")
+    device.set_property("power", 1)
+
+    await fake_http.calls_until("POST")
+
+    assert not device.connected
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
 
 
 WRONG_LAN_KEY = "f" * 32

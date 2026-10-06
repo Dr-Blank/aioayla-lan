@@ -9,6 +9,7 @@ Answering any of its requests with 206 Partial Content makes it fetch
 """
 
 import asyncio
+import json
 import logging
 import secrets
 import string
@@ -392,7 +393,15 @@ class AylaLanDevice:
         """Decrypt a pushed property value and report it."""
         if self._crypto is None:
             raise NoSessionError
-        update = self._crypto.decrypt_and_validate(doc)
+        try:
+            update = self._crypto.decrypt_and_validate(doc)
+        # Signed by the module, so only firmware quirks land here.
+        except json.JSONDecodeError as err:
+            _LOGGER.debug("%s: undecodable payload: %r", self.dsn, err.doc)
+            raise
+        except UnicodeDecodeError as err:
+            _LOGGER.debug("%s: undecodable payload: %r", self.dsn, err.object)
+            raise
         self._authenticated.set()
         self._touch()
         data = update.get("data") if isinstance(update, dict) else None
