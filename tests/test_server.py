@@ -3,7 +3,7 @@
 import asyncio
 import json
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from conftest import (
@@ -66,6 +66,11 @@ def _drained(server: AylaLanServer) -> SessionCrypto:
         pytest.param(None, "GET", "commands.json", id="no-remote"),
         pytest.param("192.0.2.99", "GET", "commands.json", id="unknown-get"),
         pytest.param("192.0.2.99", "POST", "key_exchange.json", id="unknown-post"),
+        pytest.param("", "POST", "key_exchange.json", id="empty-remote"),
+        pytest.param("not-an-ip", "POST", "key_exchange.json", id="not-an-ip"),
+        pytest.param(
+            "::ffff:192.0.2.99", "POST", "key_exchange.json", id="unknown-mapped"
+        ),
     ],
 )
 def test_unknown_remote_forbidden(
@@ -143,6 +148,15 @@ def test_key_exchange_ok_despite_primed_reads(
             {k: v for k, v in key_exchange_request().items() if k != "key_id"},
             400,
             id="missing-key-id",
+        ),
+        pytest.param(
+            key_exchange_request(key_id=str(KEY_ID)), 400, id="key-id-not-int"
+        ),
+        pytest.param(key_exchange_request(random_1=1234), 400, id="random-not-string"),
+        pytest.param(
+            {k: v for k, v in key_exchange_request().items() if k != "time_1"},
+            400,
+            id="missing-time",
         ),
     ],
 )
@@ -353,3 +367,55 @@ def test_remove_device_keeps_replacement(
     )
     assert replacement.connected
     assert not device.connected
+
+
+@pytest.mark.parametrize(
+    ("host", "remote"),
+    [
+        pytest.param(DEVICE_HOST, f"::ffff:{DEVICE_HOST}", id="mapped-remote"),
+        pytest.param(f"::ffff:{DEVICE_HOST}", DEVICE_HOST, id="mapped-host"),
+        pytest.param("2001:db8::50", "2001:DB8:0:0::50", id="ipv6-spelling"),
+        pytest.param("aircon.example", "aircon.example", id="not-an-ip"),
+    ],
+)
+def test_remote_matched_in_canonical_form(
+    connection_changes: list[bool], host: str, remote: str
+) -> None:
+    """A dual-stack listener reports IPv4 peers as IPv4-mapped IPv6."""
+    server = AylaLanServer()
+    device = AylaLanDevice(
+        MagicMock(),
+        host,
+        "OTHERDSN",
+        LanKey(LAN_KEY, KEY_ID),
+        "192.0.2.10",
+        8123,
+        lambda _: None,
+        connection_changes.append,
+    )
+    server.add_device(device)
+
+    body = _body({"key_exchange": key_exchange_request()})
+    assert server.handle(remote, "POST", "key_exchange.json", body)[0] == 200
+    assert connection_changes == [True]
+
+    server.remove_device(device)
+    assert server.handle(remote, "GET", "commands.json", b"") == (403, {})
+
+
+def test_undecodable_datapoint_rejected_session_kept(
+    server: AylaLanServer, datapoints: list[Datapoint]
+) -> None:
+    mirror = _drained(server)
+    with patch.object(json, "dumps", return_value='{"seq_no":0 "data":{}}'):
+        undecodable = mirror.encrypt_and_sign(None)
+    assert server.handle(
+        DEVICE_HOST, "POST", "property/datapoint.json", _body(undecodable)
+    ) == (400, {})
+
+    # Signed, so the chain moved past it and the next payload still validates.
+    payload = mirror.encrypt_and_sign({"seq_no": 1, "data": {"name": "power"}})
+    assert server.handle(
+        DEVICE_HOST, "POST", "property/datapoint.json", _body(payload)
+    ) == (200, {})
+    assert datapoints == [Datapoint("power", None, None)]

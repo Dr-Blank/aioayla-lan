@@ -126,3 +126,27 @@ def test_wrong_lan_key_fails_signature() -> None:
     stranger = SessionCrypto("f" * 32, "r2-ours", 222, "r1-device", 111)
     with pytest.raises(SignatureError):
         stranger.decrypt_and_validate(ours.encrypt_and_sign({"seq_no": 0}))
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        pytest.param({"enc": "AAAAA"}, id="enc-not-base64"),
+        pytest.param({"sign": "AAAAA"}, id="sign-not-base64"),
+        pytest.param({"enc": 123}, id="enc-not-string"),
+        pytest.param({"sign": None}, id="sign-not-string"),
+        pytest.param({"enc": ""}, id="enc-empty"),
+        pytest.param(
+            {"enc": base64.b64encode(b"x" * 15).decode()}, id="enc-partial-block"
+        ),
+    ],
+)
+def test_malformed_payload_rejected_without_breaking_chain(
+    tamper: dict[str, object],
+) -> None:
+    ours, device = _pair()
+    first = device.encrypt_and_sign({"seq_no": 0})
+    with pytest.raises(SignatureError):
+        ours.decrypt_and_validate(first | tamper)
+    # The untampered payload still decrypts: the chain did not move.
+    assert ours.decrypt_and_validate(first) == {"seq_no": 0}

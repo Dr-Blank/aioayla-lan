@@ -155,6 +155,10 @@ async def test_sign_in_rejected(cloud: AylaCloud, http: _FakeHttp, status: int) 
         pytest.param(
             _Reply(exception=aiohttp.ClientConnectionError("down")), id="connection"
         ),
+        pytest.param(_Reply(exception=TimeoutError()), id="timeout"),
+        pytest.param(_Reply(payload={}), id="no-token"),
+        pytest.param(_Reply(payload={"access_token": 42}), id="token-not-string"),
+        pytest.param(_Reply(payload=["token-abc"]), id="not-an-object"),
     ],
 )
 async def test_sign_in_failure(
@@ -164,6 +168,9 @@ async def test_sign_in_failure(
     with pytest.raises(CloudError) as excinfo:
         await cloud.sign_in("user@example.com", "hunter2")
     assert not isinstance(excinfo.value, CloudAuthError)
+    # Nothing usable was stored, so later calls do not go out unauthenticated.
+    with pytest.raises(CloudError, match="not signed in"):
+        await cloud.list_devices()
 
 
 async def test_list_devices(signed_in: AylaCloud, http: _FakeHttp) -> None:
@@ -195,6 +202,24 @@ async def test_get_lan_key(signed_in: AylaCloud, http: _FakeHttp) -> None:
     lan_key = await signed_in.get_lan_key(DSN)
     assert lan_key == LanKey(key="secret-key", key_id=42)
     assert "secret-key" not in repr(lan_key)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param({}, id="no-lanip"),
+        pytest.param({"lanip": None}, id="lanip-null"),
+        pytest.param({"lanip": {"lanip_key_id": 42}}, id="no-key"),
+        pytest.param({"lanip": {"lanip_key": "secret-key"}}, id="no-key-id"),
+        pytest.param([], id="not-an-object"),
+    ],
+)
+async def test_get_lan_key_malformed_reply(
+    signed_in: AylaCloud, http: _FakeHttp, payload: object
+) -> None:
+    http.replies[("GET", LAN_URL)] = _Reply(payload=payload)
+    with pytest.raises(CloudError, match=f"no LAN key for {DSN}"):
+        await signed_in.get_lan_key(DSN)
 
 
 @pytest.mark.parametrize(
