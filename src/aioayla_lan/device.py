@@ -395,15 +395,17 @@ class AylaLanDevice:
             raise NoSessionError
         try:
             update = self._crypto.decrypt_and_validate(doc)
-        # Signed by the module, so only firmware quirks land here.
+        # Signed by the module, so the key is right and only firmware quirks land
+        # here. Skipped, not refused: a refusal makes the module re-key and resend.
         except json.JSONDecodeError as err:
+            self._contact()
             _LOGGER.debug("%s: undecodable payload: %r", self.dsn, err.doc)
-            raise
+            return
         except UnicodeDecodeError as err:
+            self._contact()
             _LOGGER.debug("%s: undecodable payload: %r", self.dsn, err.object)
-            raise
-        self._authenticated.set()
-        self._touch()
+            return
+        self._contact()
         data = update.get("data") if isinstance(update, dict) else None
         if isinstance(data, dict) and "ack_status" in data:
             self._handle_ack(data)
@@ -432,6 +434,10 @@ class AylaLanDevice:
 
     def _touch(self) -> None:
         self.last_seen = time.monotonic()
+
+    def _contact(self) -> None:
+        self._authenticated.set()
+        self._touch()
 
     def _drop_session(self) -> None:
         if self._crypto is None:

@@ -403,15 +403,17 @@ def test_remote_matched_in_canonical_form(
     assert server.handle(remote, "GET", "commands.json", b"") == (403, {})
 
 
-def test_undecodable_datapoint_rejected_session_kept(
+def test_undecodable_datapoint_skipped_session_kept(
     server: AylaLanServer, datapoints: list[Datapoint]
 ) -> None:
     mirror = _drained(server)
-    with patch.object(json, "dumps", return_value='{"seq_no":0 "data":{}}'):
+    # UTY-TFSXW1 answers a read of a property it lacks like this. A 400 made it
+    # re-key and the read restart, forever.
+    with patch.object(json, "dumps", return_value='{"seq_no":28,"data":{}'):
         undecodable = mirror.encrypt_and_sign(None)
     assert server.handle(
         DEVICE_HOST, "POST", "property/datapoint.json", _body(undecodable)
-    ) == (400, {})
+    ) == (200, {})
 
     # Signed, so the chain moved past it and the next payload still validates.
     payload = mirror.encrypt_and_sign({"seq_no": 1, "data": {"name": "power"}})
@@ -419,3 +421,19 @@ def test_undecodable_datapoint_rejected_session_kept(
         DEVICE_HOST, "POST", "property/datapoint.json", _body(payload)
     ) == (200, {})
     assert datapoints == [Datapoint("power", None, None)]
+
+
+def test_undecodable_reply_keeps_reads_going(server: AylaLanServer) -> None:
+    mirror = _key_exchange(server)
+    first = mirror.decrypt_and_validate(_fetch(server)[1])
+    with patch.object(json, "dumps", return_value='{"seq_no":28,"data":{}'):
+        undecodable = mirror.encrypt_and_sign(None)
+
+    # Reads remain, so the module is told to fetch again rather than re-key.
+    assert server.handle(
+        DEVICE_HOST, "POST", "property/datapoint.json", _body(undecodable)
+    ) == (206, {})
+    second = mirror.decrypt_and_validate(_fetch(server)[1])
+    assert [body["data"]["cmds"][0]["cmd"]["resource"] for body in (first, second)] == [
+        f"property.json?name={name}" for name in PRIME[:2]
+    ]

@@ -416,6 +416,10 @@ def test_nothing_queued_does_not_wake(
     assert not device._wake.is_set()
 
 
+def _undecodable_datapoint(device: AylaLanDevice, mirror: SessionCrypto) -> None:
+    device.handle_datapoint(_sign_raw(mirror, b'{"seq_no":0 "data":{}}'))
+
+
 @pytest.mark.parametrize(
     "contact",
     [
@@ -426,6 +430,7 @@ def test_nothing_queued_does_not_wake(
             ),
             id="datapoint",
         ),
+        pytest.param(_undecodable_datapoint, id="undecodable-datapoint"),
     ],
 )
 def test_contact_updates_last_seen(
@@ -516,8 +521,7 @@ def test_handle_datapoint_logs_undecodable_payload(
         payload = mirror.encrypt_and_sign(None)
     caplog.set_level(logging.DEBUG, logger="aioayla_lan")
 
-    with pytest.raises(json.JSONDecodeError):
-        device.handle_datapoint(payload)
+    device.handle_datapoint(payload)
 
     assert datapoints == []
     # Only the plaintext is logged, never the payload or session material.
@@ -545,8 +549,7 @@ def test_handle_datapoint_logs_non_utf8_payload(
     payload = _sign_raw(mirror, text)
     caplog.set_level(logging.DEBUG, logger="aioayla_lan")
 
-    with pytest.raises(UnicodeDecodeError):
-        device.handle_datapoint(payload)
+    device.handle_datapoint(payload)
 
     assert caplog.messages == [f"{DSN}: undecodable payload: {text!r}"]
 
@@ -1343,6 +1346,33 @@ async def test_verify_invalid_key_when_datapoint_fails_hmac(
     with pytest.raises(InvalidKeyError):
         await verify
     assert device.key_id == KEY_ID
+
+
+@pytest.mark.parametrize(
+    "plaintext",
+    [
+        pytest.param(b'{"seq_no":28,"data":{}', id="bad-json"),
+        pytest.param(
+            b'{"seq_no":0,"data":{"name":"device_name","value":"20\xb0C"}}',
+            id="non-utf8",
+        ),
+    ],
+)
+async def test_verify_accepts_key_when_datapoint_is_undecodable(
+    fake_http: _FakeHttp, datapoints: list[Datapoint], plaintext: bytes
+) -> None:
+    device = _verifier(fake_http, datapoints, LanKey(LAN_KEY, KEY_ID))
+    verify = asyncio.create_task(device.verify(VERIFY_TIMEOUT))
+    await fake_http.next_call()
+    mirror = device_side(device.handle_key_exchange(key_exchange_request()))
+    device.handle_datapoint(_sign_raw(mirror, plaintext))
+    # Further exchanges must not read as a rejected key either.
+    for _ in range(REJECTED_KEY_EXCHANGES):
+        device.handle_key_exchange(key_exchange_request())
+
+    # The signature proves the key even when the firmware's JSON is broken.
+    assert await verify == KEY_ID
+    assert datapoints == []
     assert datapoints == []
 
 
