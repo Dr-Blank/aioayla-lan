@@ -17,6 +17,7 @@ from .exceptions import (
     WriteError,
     WriteExpiredError,
     WriteRejectedError,
+    WriteUnacknowledgedError,
 )
 from .models import Datapoint, LanKey
 from .server import AylaLanServer
@@ -44,5 +45,6 @@ __all__ = [
     "WriteError",
     "WriteExpiredError",
     "WriteRejectedError",
+    "WriteUnacknowledgedError",
     "fetch_dsn",
 ]

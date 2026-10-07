@@ -32,6 +32,7 @@ from .exceptions import (
     WriteError,
     WriteExpiredError,
     WriteRejectedError,
+    WriteUnacknowledgedError,
 )
 from .models import Datapoint, LanKey
 
@@ -56,10 +57,11 @@ NOTIFY_TIMEOUT = 3.0
 
 A notified module fetches within a second, so silence means it went quiet.
 """
-ACK_TIMEOUT = 5.0
-"""Wait for a collected write to be acked.
+ACK_TIMEOUT = 10.0
+"""Wait for a collected write to be acked, as long as the Ayla SDK waits.
 
-The module acks a write about a second after collecting it, or never.
+A settled module acks about a second after collecting a write; one busy after
+a reboot can take longer, and a property without acks enabled is never acked.
 """
 WRITE_TTL = 30.0
 """Age at which an uncollected write is dropped rather than applied late."""
@@ -218,10 +220,11 @@ class AylaLanDevice:
         """Write a property and wait until the device acknowledges it.
 
         Raises :exc:`WriteExpiredError` when the device does not collect the
-        write within :data:`WRITE_TTL` and :exc:`WriteRejectedError` when it
-        collects the write but does not acknowledge it within
-        :data:`ACK_TIMEOUT`. A newer write to the same name before collection
-        replaces this one; the caller then learns the newer write's fate.
+        write within :data:`WRITE_TTL`, :exc:`WriteRejectedError` when it
+        refuses the write and :exc:`WriteUnacknowledgedError` when it sends no
+        ack within :data:`ACK_TIMEOUT`, which does not prove the write failed.
+        A newer write to the same name before collection replaces this one; the
+        caller then learns the newer write's fate.
         """
         future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         write = self._queue_write(name, value, base_type)
@@ -337,6 +340,13 @@ class AylaLanDevice:
         if self._writes:
             write = self._writes.pop(next(iter(self._writes)))
             data = write.command()
+            _LOGGER.debug(
+                "%s: sending %s = %r (id %s)",
+                self.dsn,
+                write.name,
+                write.value,
+                write.id,
+            )
             if write.timer:
                 write.timer.cancel()
             if write.futures:
@@ -385,8 +395,17 @@ class AylaLanDevice:
     def _ack_timed_out(self, write_id: str) -> None:
         if (write := self._unacked.pop(write_id, None)) is not None:
             write.timer = None
+            _LOGGER.debug(
+                "%s: no ack for %s (id %s) within %s s",
+                self.dsn,
+                write.name,
+                write_id,
+                ACK_TIMEOUT,
+            )
             write.settle(
-                WriteRejectedError(f"{self.dsn}: {write.name} was not acknowledged")
+                WriteUnacknowledgedError(
+                    f"{self.dsn}: {write.name} was not acknowledged"
+                )
             )
 
     def handle_datapoint(self, doc: dict[str, Any]) -> None:
@@ -423,8 +442,13 @@ class AylaLanDevice:
         if not isinstance(write_id, str) or (
             (write := self._unacked.pop(write_id, None)) is None
         ):
+            # Late, or a shape we do not know: logged to learn which.
+            _LOGGER.debug("%s: ack for no pending write: %s", self.dsn, ack)
             return
         status = ack["ack_status"]
+        _LOGGER.debug(
+            "%s: ack %s for %s (id %s)", self.dsn, status, write.name, write_id
+        )
         if isinstance(status, int) and 200 <= status < 300:
             write.settle()
         else:
@@ -443,6 +467,9 @@ class AylaLanDevice:
         if self._crypto is None:
             return
         self._crypto = None
+        _LOGGER.debug(
+            "%s: session lost, silent for %.0f s", self.dsn, self._silent_for()
+        )
         if self._on_connection_change:
             self._on_connection_change(False)
 
@@ -457,6 +484,13 @@ class AylaLanDevice:
         self._key_exchanges = 0
         self._key_rejected.clear()
         self._authenticated.clear()
+        _LOGGER.debug(
+            "%s: registering at %s, callback %s:%s",
+            self.dsn,
+            self.host,
+            self._callback_host,
+            self._callback_port,
+        )
         try:
             await self._register(True, 1)
         except aiohttp.ClientResponseError as err:
@@ -478,6 +512,7 @@ class AylaLanDevice:
         """
         # Let a just-created run() task start, so it is not doubled.
         await asyncio.sleep(0)
+        started = time.monotonic()
         runner = None if self._running else asyncio.create_task(self._run(False))
         waiters = [
             asyncio.create_task(self._authenticated.wait()),
@@ -492,6 +527,13 @@ class AylaLanDevice:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+        _LOGGER.debug(
+            "%s: verify ended after %.1f s: authenticated=%s, key exchanges=%d",
+            self.dsn,
+            time.monotonic() - started,
+            self._authenticated.is_set(),
+            self._key_exchanges,
+        )
         if not self._authenticated.is_set():
             if self._key_exchanges:
                 raise InvalidKeyError(f"{self.dsn}: no payload validated")
@@ -534,7 +576,7 @@ class AylaLanDevice:
         try:
             await self._register(first, notify)
         except (aiohttp.ClientError, TimeoutError) as err:
-            _LOGGER.debug("%s: registration failed: %s", self.dsn, err)
+            _LOGGER.debug("%s: registration failed: %r", self.dsn, err)
             if isinstance(err, aiohttp.ClientResponseError) and not first:
                 # The module forgot us: register afresh straight away.
                 return True
@@ -551,6 +593,7 @@ class AylaLanDevice:
             if notify and not await self._drained(heartbeat_at):
                 # A module can accept every notify yet never dial back; only
                 # registering afresh makes it key-exchange again.
+                _LOGGER.debug("%s: notified, but the queue was not collected", self.dsn)
                 return self.connected and self._silent_for() > SESSION_TIMEOUT
             # Anything queued while draining has been served already.
             if not self.pending:

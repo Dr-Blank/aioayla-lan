@@ -7,6 +7,7 @@ import hmac
 import itertools
 import json
 import logging
+import re
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
 from contextlib import AbstractContextManager, nullcontext
 from typing import Any
@@ -41,6 +42,7 @@ from aioayla_lan import (
     SignatureError,
     WriteExpiredError,
     WriteRejectedError,
+    WriteUnacknowledgedError,
 )
 from aioayla_lan.crypto import zero_pad
 from aioayla_lan.device import REJECTED_KEY_EXCHANGES, RETRY_INTERVAL, WRITE_TTL
@@ -562,27 +564,34 @@ async def _queue_async_write(
     return task
 
 
+def _refused(status: object) -> AbstractContextManager[object]:
+    """Expect an explicit refusal, never mistaken for a missing ack."""
+    return pytest.raises(
+        WriteRejectedError,
+        match=f"ack_status {status}",
+        check=lambda err: not isinstance(err, WriteUnacknowledgedError),
+    )
+
+
 @pytest.mark.parametrize(
     ("status", "expectation"),
     [
         pytest.param(200, nullcontext(), id="200"),
         pytest.param(204, nullcontext(), id="204"),
-        pytest.param(
-            400, pytest.raises(WriteRejectedError, match="ack_status 400"), id="400"
-        ),
-        pytest.param(
-            500, pytest.raises(WriteRejectedError, match="ack_status 500"), id="500"
-        ),
-        pytest.param("200", pytest.raises(WriteRejectedError), id="not-int"),
+        pytest.param(400, _refused(400), id="400"),
+        pytest.param(500, _refused(500), id="500"),
+        pytest.param("200", _refused("200"), id="not-int"),
     ],
 )
 async def test_async_set_property_settled_by_ack(
     device: AylaLanDevice,
     mirror: SessionCrypto,
     datapoints: list[Datapoint],
+    caplog: pytest.LogCaptureFixture,
     status: object,
     expectation: AbstractContextManager[object],
 ) -> None:
+    caplog.set_level(logging.DEBUG, logger="aioayla_lan")
     write = await _queue_async_write(device)
     write_id = _written(device, mirror)["id"]
     await asyncio.sleep(0)
@@ -593,19 +602,40 @@ async def test_async_set_property_settled_by_ack(
     with expectation:
         await asyncio.wait_for(write, 1)
     assert datapoints == []
+    assert caplog.messages == [
+        f"{DSN}: sending power = 1 (id {write_id})",
+        f"{DSN}: ack {status} for power (id {write_id})",
+    ]
 
 
-async def test_async_set_property_rejected_without_ack(
-    device: AylaLanDevice, mirror: SessionCrypto, monkeypatch: pytest.MonkeyPatch
+async def test_async_set_property_unacknowledged_without_ack(
+    device: AylaLanDevice,
+    mirror: SessionCrypto,
+    datapoints: list[Datapoint],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    caplog.set_level(logging.DEBUG, logger="aioayla_lan")
     monkeypatch.setattr("aioayla_lan.device.ACK_TIMEOUT", 0.01)
     write = await _queue_async_write(device)
     write_id = _written(device, mirror)["id"]
 
-    with pytest.raises(WriteRejectedError, match="power was not acknowledged"):
+    # Callers that only handle WriteRejectedError still catch a missing ack.
+    with pytest.raises(
+        WriteRejectedError, match=f"^{DSN}: power was not acknowledged$"
+    ) as exc_info:
         await asyncio.wait_for(write, 1)
+    assert type(exc_info.value) is WriteUnacknowledgedError
     # A late ack finds nothing to settle.
     device.handle_datapoint(_ack(mirror, write_id))
+
+    assert datapoints == []
+    late = {"id": write_id, "ack_status": 200, "ack_message": 0}
+    assert caplog.messages == [
+        f"{DSN}: sending power = 1 (id {write_id})",
+        f"{DSN}: no ack for power (id {write_id}) within 0.01 s",
+        f"{DSN}: ack for no pending write: {late}",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -716,14 +746,18 @@ async def test_ack_with_unknown_id_ignored(
     device: AylaLanDevice,
     mirror: SessionCrypto,
     datapoints: list[Datapoint],
+    caplog: pytest.LogCaptureFixture,
     ack_id: object,
 ) -> None:
     write = await _queue_async_write(device)
     write_id = _written(device, mirror)["id"]
+    caplog.set_level(logging.DEBUG, logger="aioayla_lan")
 
     device.handle_datapoint(_ack(mirror, ack_id, 500))
     await asyncio.sleep(0)
     assert not write.done()
+    unmatched = {"id": ack_id, "ack_status": 500, "ack_message": 0}
+    assert caplog.messages == [f"{DSN}: ack for no pending write: {unmatched}"]
 
     device.handle_datapoint(_ack(mirror, write_id))
     await asyncio.wait_for(write, 1)
@@ -971,7 +1005,9 @@ async def test_run_notifies_again_when_module_stalls(
     runner: Callable[[], AylaLanDevice],
     fake_http: _FakeHttp,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    caplog.set_level(logging.DEBUG, logger="aioayla_lan")
     monkeypatch.setattr("aioayla_lan.device.NOTIFY_TIMEOUT", 0.05)
     device = runner()
     await fake_http.next_call()
@@ -986,6 +1022,7 @@ async def test_run_notifies_again_when_module_stalls(
     assert [(c.method, c.notify) for c in (notify, renotify)] == [("PUT", 1)] * 2
     assert renotify.at - notify.at >= 0.05 - SLACK
     assert device.pending
+    assert f"{DSN}: notified, but the queue was not collected" in caplog.messages
 
 
 async def test_run_registers_afresh_when_notifies_go_unanswered(
@@ -1165,8 +1202,10 @@ async def test_run_drops_session_after_session_timeout(
     fake_http: _FakeHttp,
     connection_changes: list[bool],
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
     error: BaseException,
 ) -> None:
+    caplog.set_level(logging.DEBUG, logger="aioayla_lan")
     monkeypatch.setattr("aioayla_lan.device.HEARTBEAT_INTERVAL", 0.3)
     monkeypatch.setattr("aioayla_lan.device.SESSION_TIMEOUT", 0.1)
     monkeypatch.setattr("aioayla_lan.device.RETRY_INTERVAL", 0.01)
@@ -1186,6 +1225,37 @@ async def test_run_drops_session_after_session_timeout(
     assert fresh.notify == 1
     assert not device.connected
     assert connection_changes == [True, False]
+    assert re.search(rf"{DSN}: session lost, silent for \d+ s", caplog.text)
+
+
+@pytest.mark.parametrize(
+    ("error", "logged"),
+    [
+        pytest.param(
+            aiohttp.ClientConnectionError("refused"),
+            "ClientConnectionError('refused')",
+            id="client-error",
+        ),
+        # str() of a bare TimeoutError is blank.
+        pytest.param(TimeoutError(), "TimeoutError()", id="timeout"),
+    ],
+)
+async def test_run_registration_failure_logged(
+    runner: Callable[[], AylaLanDevice],
+    fake_http: _FakeHttp,
+    caplog: pytest.LogCaptureFixture,
+    error: BaseException,
+    logged: str,
+) -> None:
+    caplog.set_level(logging.DEBUG, logger="aioayla_lan")
+    fake_http.errors.append(error)
+    device = runner()
+    await fake_http.next_call()
+    device.set_property("power", 1)
+    # The retry proves the failure was handled, and so logged.
+    await fake_http.next_call()
+
+    assert caplog.messages == [f"{DSN}: registration failed: {logged}"]
 
 
 async def test_run_failure_without_session_does_not_report(
@@ -1582,6 +1652,58 @@ async def test_wait_verified_cancels_its_tasks(
     assert (await fake_http.next_call()).method == "PUT"
     assert fake_http.calls.empty()
     assert asyncio.all_tasks() == {asyncio.current_task()}
+
+
+@pytest.mark.parametrize(
+    ("session", "timeout", "expectation", "outcome"),
+    [
+        pytest.param(
+            _authenticate,
+            5,
+            nullcontext(),
+            "authenticated=True, key exchanges=1",
+            id="authenticated",
+        ),
+        pytest.param(
+            _no_session,
+            VERIFY_TIMEOUT,
+            pytest.raises(NoCallbackError),
+            "authenticated=False, key exchanges=0",
+            id="no-callback",
+        ),
+        pytest.param(
+            _one_exchange,
+            VERIFY_TIMEOUT,
+            pytest.raises(InvalidKeyError),
+            "authenticated=False, key exchanges=1",
+            id="invalid-key",
+        ),
+    ],
+)
+async def test_wait_verified_logs_outcome(
+    clock: _Clock,
+    fake_http: _FakeHttp,
+    datapoints: list[Datapoint],
+    caplog: pytest.LogCaptureFixture,
+    session: Callable[[AylaLanDevice], None],
+    timeout: float,
+    expectation: AbstractContextManager[object],
+    outcome: str,
+) -> None:
+    caplog.set_level(logging.DEBUG, logger="aioayla_lan")
+    device = await _registered(fake_http, datapoints)
+    wait = asyncio.create_task(device.wait_verified(timeout))
+    await asyncio.sleep(0.01)
+    session(device)
+    clock.now += 2
+
+    with expectation:
+        await asyncio.wait_for(wait, 1)
+
+    assert caplog.messages[0] == (
+        f"{DSN}: registering at {DEVICE_HOST}, callback {CALLBACK_HOST}:{CALLBACK_PORT}"
+    )
+    assert caplog.messages[-1] == f"{DSN}: verify ended after 2.0 s: {outcome}"
 
 
 async def test_wait_verified_right_after_starting_run_does_not_double_it(

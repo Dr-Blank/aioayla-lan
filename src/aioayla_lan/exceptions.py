@@ -42,9 +42,19 @@ class WriteExpiredError(WriteError):
 
 
 class WriteRejectedError(WriteError):
-    """The device collected a write but did not acknowledge it.
+    """The device collected a write and refused it.
 
-    Firmware drops unknown names and out-of-range values without a word.
+    Also the base of :exc:`WriteUnacknowledgedError`, so catching this covers a
+    missing ack too.
+    """
+
+
+class WriteUnacknowledgedError(WriteRejectedError):
+    """The device collected a write but sent no ack in time.
+
+    Not proof the write failed: modules only ack properties the cloud marks
+    ack-enabled, and a busy module can ack late. Firmware also drops unknown
+    names and out-of-range values without a word. Read the property back.
     """
 
 

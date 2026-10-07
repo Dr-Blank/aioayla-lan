@@ -9,7 +9,7 @@ Values are passed through uninterpreted. What a property means is up to the call
 ## Behaviour worth knowing
 
 - **Return the status `AylaLanServer.handle` gives you.** It answers 206 Partial Content while commands are queued, which makes the module fetch the next one at once instead of waiting for another notify. A queue of 50 reads drains in about 2 s.
-- **Writes are acknowledged.** `await device.async_set_property(name, value, base_type)` returns once the module acks, about a second after it collects the write. It raises `WriteRejectedError` when no ack comes (modules drop unknown names and out-of-range values silently) and `WriteExpiredError` when the module does not collect the write within 30 s. `set_property` queues without waiting.
+- **Writes are acknowledged, when the module acks.** `await device.async_set_property(name, value, base_type)` returns once the module acks, about a second after it collects the write. It raises `WriteExpiredError` when the module does not collect the write within 30 s, `WriteRejectedError` when the module refuses it, and `WriteUnacknowledgedError` (a `WriteRejectedError`) when no ack comes within 10 s. A missing ack does not mean the write failed: modules only ack properties the cloud marks ack-enabled, a busy module can ack late, and modules also drop unknown names and out-of-range values silently. Read the property back to learn the outcome. `set_property` queues without waiting.
 - **Read back after a write.** Modules do not reliably echo what they were sent, nor what a write changed elsewhere.
 - **One command per payload.** A module may ignore a batched `cmds` array and re-key.
 - **Queue semantics.** Writes go before reads. A newer write to a queued name replaces it, and a repeated read is asked once.
