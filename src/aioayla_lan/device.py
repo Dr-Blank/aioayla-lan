@@ -341,7 +341,7 @@ class AylaLanDevice:
             write = self._writes.pop(next(iter(self._writes)))
             data = write.command()
             _LOGGER.debug(
-                "%s: sending %s = %r (id %s)",
+                "%s: sending %s = %s (id %s)",
                 self.dsn,
                 write.name,
                 write.value,

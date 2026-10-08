@@ -10,6 +10,7 @@ import logging
 import re
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
 from contextlib import AbstractContextManager, nullcontext
+from enum import IntEnum
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -606,6 +607,21 @@ async def test_async_set_property_settled_by_ack(
         f"{DSN}: sending power = 1 (id {write_id})",
         f"{DSN}: ack {status} for power (id {write_id})",
     ]
+
+
+class _Mode(IntEnum):
+    FAN = 5
+
+
+def test_write_logs_enum_as_plain_value(
+    device: AylaLanDevice, mirror: SessionCrypto, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.DEBUG, logger="aioayla_lan")
+    device.set_property("mode", _Mode.FAN)
+
+    write_id = _written(device, mirror)["id"]
+
+    assert caplog.messages == [f"{DSN}: sending mode = 5 (id {write_id})"]
 
 
 async def test_async_set_property_unacknowledged_without_ack(
