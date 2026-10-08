@@ -67,7 +67,15 @@ class AylaLanServer:
         ):
             _LOGGER.debug("rejecting callback from unknown address %s", remote)
             return 403, {}
+        status, reply = self._route(device, method, path, body)
+        _LOGGER.debug(
+            "%s: %s %s, %d bytes: %s", device.dsn, method, path, len(body), status
+        )
+        return status, reply
 
+    def _route(
+        self, device: AylaLanDevice, method: str, path: str, body: bytes
+    ) -> tuple[int, Any]:
         if method == "GET":
             if not path.endswith("commands.json"):
                 return 404, {}

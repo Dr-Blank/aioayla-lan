@@ -2,12 +2,14 @@
 
 import asyncio
 import json
+import logging
 from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 from conftest import (
     DEVICE_HOST,
+    DSN,
     KEY_ID,
     LAN_KEY,
     PRIME,
@@ -74,10 +76,16 @@ def _drained(server: AylaLanServer) -> SessionCrypto:
     ],
 )
 def test_unknown_remote_forbidden(
-    server: AylaLanServer, remote: str | None, method: str, path: str
+    server: AylaLanServer,
+    caplog: pytest.LogCaptureFixture,
+    remote: str | None,
+    method: str,
+    path: str,
 ) -> None:
+    caplog.set_level(logging.DEBUG, logger="aioayla_lan")
     body = _body({"key_exchange": key_exchange_request()})
     assert server.handle(remote, method, path, body) == (403, {})
+    assert caplog.messages == [f"rejecting callback from unknown address {remote}"]
 
 
 def test_get_other_path_not_found(server: AylaLanServer) -> None:
@@ -123,6 +131,65 @@ def test_get_commands_partial_while_write_queued(
     device.set_property("power", 1)
     device.set_property("mode", 1)
     assert [_fetch(server)[0] for _ in range(3)] == [206, 200, 200]
+
+
+@pytest.mark.parametrize(
+    ("fetches", "status"),
+    [
+        pytest.param(0, 206, id="more-queued"),
+        pytest.param(len(PRIME) - 1, 200, id="last"),
+        pytest.param(len(PRIME), 200, id="empty"),
+    ],
+)
+def test_get_commands_logged_with_status(
+    server: AylaLanServer,
+    caplog: pytest.LogCaptureFixture,
+    fetches: int,
+    status: int,
+) -> None:
+    _key_exchange(server)
+    for _ in range(fetches):
+        _fetch(server)
+    caplog.set_level(logging.DEBUG, logger="aioayla_lan.server")
+
+    assert _fetch(server)[0] == status
+    assert caplog.messages == [f"{DSN}: GET commands.json, 0 bytes: {status}"]
+
+
+@pytest.mark.parametrize(
+    ("fetches", "status"),
+    [
+        pytest.param(0, 206, id="queued"),
+        pytest.param(len(PRIME), 200, id="empty"),
+    ],
+)
+def test_datapoint_logged_with_status(
+    server: AylaLanServer,
+    caplog: pytest.LogCaptureFixture,
+    fetches: int,
+    status: int,
+) -> None:
+    mirror = _key_exchange(server)
+    for _ in range(fetches):
+        _fetch(server)
+    body = _body(mirror.encrypt_and_sign({"seq_no": 0, "data": DATAPOINT}))
+    caplog.set_level(logging.DEBUG, logger="aioayla_lan.server")
+
+    assert server.handle(DEVICE_HOST, "POST", "property/datapoint.json", body) == (
+        status,
+        {},
+    )
+    assert caplog.messages == [
+        f"{DSN}: POST property/datapoint.json, {len(body)} bytes: {status}"
+    ]
+
+
+def test_rejected_request_logged_with_status(
+    server: AylaLanServer, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.DEBUG, logger="aioayla_lan.server")
+    assert _fetch(server) == (400, {})
+    assert caplog.messages == [f"{DSN}: GET commands.json, 0 bytes: 400"]
 
 
 def test_key_exchange_ok_despite_primed_reads(

@@ -50,6 +50,14 @@ SESSION_TIMEOUT = 30.0
 
 The module forgets a registration it has not heard from in keep_alive.
 """
+STALLED_SESSIONS = 3
+"""Stalled sessions in a row before re-keying backs off.
+
+A stalled session stops collecting with work queued; a new key exchange is the
+only thing that gets such a module fetching again.
+"""
+MAX_REKEY_INTERVAL = 120.0
+"""Longest silence before a stalled session is replaced, once backed off."""
 RETRY_INTERVAL = 2.0
 """Pace of heartbeat retries while the session may still be alive."""
 NOTIFY_TIMEOUT = 3.0
@@ -185,7 +193,9 @@ class AylaLanDevice:
         self._collected = asyncio.Event()
         self._running = False
         self._registered_at = 0.0
+        self._keyed_at = 0.0
         self._key_exchanges = 0
+        self._stalled_sessions = 0
         self._key_rejected = asyncio.Event()
         self._authenticated = asyncio.Event()
         self.last_seen: float | None = None
@@ -326,6 +336,7 @@ class AylaLanDevice:
         if not self.pending:
             self._pending_since = None
         self.request_properties(self._prime)
+        self._keyed_at = time.monotonic()
         _LOGGER.debug("%s: session established", self.dsn)
         if self._on_connection_change:
             self._on_connection_change(True)
@@ -341,11 +352,12 @@ class AylaLanDevice:
             write = self._writes.pop(next(iter(self._writes)))
             data = write.command()
             _LOGGER.debug(
-                "%s: sending %s = %s (id %s)",
+                "%s: sending %s = %s (id %s, seq %s)",
                 self.dsn,
                 write.name,
                 write.value,
                 write.id,
+                self._cmd_seq,
             )
             if write.timer:
                 write.timer.cancel()
@@ -358,6 +370,13 @@ class AylaLanDevice:
             name = next(iter(self._reads))
             del self._reads[name]
             data = self._read_command(name)
+            _LOGGER.debug(
+                "%s: sending read of %s (cmd_id %s, seq %s)",
+                self.dsn,
+                name,
+                data["cmds"][0]["cmd"]["cmd_id"],
+                self._cmd_seq,
+            )
         else:
             data = {}
         if not self.pending:
@@ -391,6 +410,8 @@ class AylaLanDevice:
                 _LOGGER.debug("%s: dropping stale write of %s", self.dsn, name)
                 del self._writes[name]
                 write.settle(WriteExpiredError(f"{self.dsn}: {name} was not collected"))
+        if not self.pending:
+            self._pending_since = None
 
     def _ack_timed_out(self, write_id: str) -> None:
         if (write := self._unacked.pop(write_id, None)) is not None:
@@ -482,6 +503,7 @@ class AylaLanDevice:
         :meth:`wait_verified`. Takes the module's LAN session from any other client.
         """
         self._key_exchanges = 0
+        self._stalled_sessions = 0
         self._key_rejected.clear()
         self._authenticated.clear()
         _LOGGER.debug(
@@ -594,7 +616,31 @@ class AylaLanDevice:
                 # A module can accept every notify yet never dial back; only
                 # registering afresh makes it key-exchange again.
                 _LOGGER.debug("%s: notified, but the queue was not collected", self.dsn)
-                return self.connected and self._silent_for() > SESSION_TIMEOUT
+                if not self.connected:
+                    return False
+                if self._silent_for() > self._rekey_after():
+                    self._stalled_sessions += 1
+                    _LOGGER.debug(
+                        "%s: session stalled (%d in a row), keying a new one",
+                        self.dsn,
+                        self._stalled_sessions,
+                    )
+                    return True
+                # A write is someone waiting, so it is not held back by the
+                # back-off; it still re-keys at most once per SESSION_TIMEOUT.
+                self._expire_writes()
+                if (
+                    self._writes
+                    and self._stalled_sessions
+                    and time.monotonic() - self._keyed_at > SESSION_TIMEOUT
+                ):
+                    _LOGGER.debug(
+                        "%s: session stalled, keying a new one for a write", self.dsn
+                    )
+                    return True
+                return False
+            if notify:
+                self._stalled_sessions = 0
             # Anything queued while draining has been served already.
             if not self.pending:
                 self._wake.clear()
@@ -617,12 +663,21 @@ class AylaLanDevice:
             self._collected.clear()
         return True
 
+    def _rekey_after(self) -> float:
+        """Silence after which a stalled session is replaced, backing off."""
+        backoff = self._stalled_sessions - STALLED_SESSIONS + 1
+        if backoff <= 0:
+            return SESSION_TIMEOUT
+        return min(SESSION_TIMEOUT * (1 << backoff), MAX_REKEY_INTERVAL)
+
     def _last_contact(self) -> float:
         return max(self._registered_at, self.last_seen or 0.0)
 
     def _silent_for(self) -> float:
-        # Registrations do not count: a mute module still accepts them.
-        return time.monotonic() - (self.last_seen or self._registered_at)
+        # Registrations do not count: a mute module still accepts them. A key
+        # exchange does, so a session that goes quiet at once gets its full time.
+        heard = max(self.last_seen or 0.0, self._keyed_at)
+        return time.monotonic() - heard
 
     async def _register(self, first: bool, notify: int) -> None:
         body = {
@@ -640,4 +695,11 @@ class AylaLanDevice:
             json=body,
             timeout=aiohttp.ClientTimeout(total=REGISTER_TIMEOUT),
         ) as resp:
+            _LOGGER.debug(
+                "%s: %s local_reg notify=%s: %s",
+                self.dsn,
+                "POST" if first else "PUT",
+                notify,
+                resp.status,
+            )
             resp.raise_for_status()

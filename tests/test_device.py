@@ -46,7 +46,13 @@ from aioayla_lan import (
     WriteUnacknowledgedError,
 )
 from aioayla_lan.crypto import zero_pad
-from aioayla_lan.device import REJECTED_KEY_EXCHANGES, RETRY_INTERVAL, WRITE_TTL
+from aioayla_lan.device import (
+    REJECTED_KEY_EXCHANGES,
+    RETRY_INTERVAL,
+    SESSION_TIMEOUT,
+    STALLED_SESSIONS,
+    WRITE_TTL,
+)
 
 START = 1000.0
 
@@ -604,7 +610,7 @@ async def test_async_set_property_settled_by_ack(
         await asyncio.wait_for(write, 1)
     assert datapoints == []
     assert caplog.messages == [
-        f"{DSN}: sending power = 1 (id {write_id})",
+        f"{DSN}: sending power = 1 (id {write_id}, seq 0)",
         f"{DSN}: ack {status} for power (id {write_id})",
     ]
 
@@ -621,7 +627,25 @@ def test_write_logs_enum_as_plain_value(
 
     write_id = _written(device, mirror)["id"]
 
-    assert caplog.messages == [f"{DSN}: sending mode = 5 (id {write_id})"]
+    assert caplog.messages == [f"{DSN}: sending mode = 5 (id {write_id}, seq 0)"]
+
+
+def test_commands_log_cmd_id_and_seq(
+    device: AylaLanDevice, mirror: SessionCrypto, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.DEBUG, logger="aioayla_lan")
+    device.set_property("power", 1)
+
+    write_id = _written(device, mirror)["id"]
+    for _ in PRIME:
+        _commands(device, mirror)
+
+    # The write takes seq 0 but no cmd_id, so the two counters differ.
+    assert caplog.messages == [
+        f"{DSN}: sending power = 1 (id {write_id}, seq 0)",
+        f"{DSN}: sending read of power (cmd_id 1, seq 1)",
+        f"{DSN}: sending read of mode (cmd_id 2, seq 2)",
+    ]
 
 
 async def test_async_set_property_unacknowledged_without_ack(
@@ -648,7 +672,7 @@ async def test_async_set_property_unacknowledged_without_ack(
     assert datapoints == []
     late = {"id": write_id, "ack_status": 200, "ack_message": 0}
     assert caplog.messages == [
-        f"{DSN}: sending power = 1 (id {write_id})",
+        f"{DSN}: sending power = 1 (id {write_id}, seq 0)",
         f"{DSN}: no ack for power (id {write_id}) within 0.01 s",
         f"{DSN}: ack for no pending write: {late}",
     ]
@@ -865,8 +889,9 @@ class _Registration:
 
 
 class _FakeResponse:
-    def __init__(self, error: BaseException | None) -> None:
+    def __init__(self, error: aiohttp.ClientResponseError | None) -> None:
         self._error = error
+        self.status = 200 if error is None else error.status
 
     def raise_for_status(self) -> None:
         if self._error is not None:
@@ -881,8 +906,13 @@ class _FakeRequest:
     async def __aenter__(self) -> _FakeResponse:
         await self._http.calls.put(self._call)
         if self._http.errors:
-            return _FakeResponse(self._http.errors.pop(0))
-        return _FakeResponse(self._http.failing.get(self._call.method))
+            error = self._http.errors.pop(0)
+        else:
+            error = self._http.failing.get(self._call.method)
+        # Only an HTTP error comes with a response; anything else has none.
+        if error is None or isinstance(error, aiohttp.ClientResponseError):
+            return _FakeResponse(error)
+        raise error
 
     async def __aexit__(self, *exc: object) -> None:
         return None
@@ -1070,6 +1100,258 @@ async def test_run_registers_afresh_when_notifies_go_unanswered(
     assert connection_changes == [True]
 
 
+async def test_run_fresh_session_gets_full_timeout(
+    runner: Callable[[], AylaLanDevice],
+    fake_http: _FakeHttp,
+    connection_changes: list[bool],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A module that re-keys but never fetches is not re-keyed every notify."""
+    monkeypatch.setattr("aioayla_lan.device.NOTIFY_TIMEOUT", 0.02)
+    monkeypatch.setattr("aioayla_lan.device.SESSION_TIMEOUT", 0.1)
+    loop = asyncio.get_running_loop()
+    device = runner()
+    await fake_http.next_call()
+    mirror = device_side(device.handle_key_exchange(key_exchange_request()))
+    _commands(device, mirror)
+    # Last heard from longer ago than SESSION_TIMEOUT when it keys again.
+    await asyncio.sleep(0.15)
+    device.handle_key_exchange(key_exchange_request())
+    keyed = loop.time()
+    device.request_properties(["power"])
+
+    *ignored, fresh = await fake_http.calls_until("POST")
+
+    assert {(c.method, c.notify) for c in ignored} == {("PUT", 1)}
+    assert len(ignored) >= 2
+    assert fresh.at - keyed >= 0.1 - SLACK
+    assert connection_changes == [True, True]
+
+
+@pytest.mark.parametrize(
+    ("stalled", "rekey_after"),
+    [
+        pytest.param(0, 30.0, id="0"),
+        pytest.param(1, 30.0, id="1"),
+        pytest.param(2, 30.0, id="2"),
+        pytest.param(3, 60.0, id="3"),
+        pytest.param(4, 120.0, id="4"),
+        pytest.param(5, 120.0, id="5-capped"),
+    ],
+)
+def test_rekey_after_backs_off(
+    device: AylaLanDevice, stalled: int, rekey_after: float
+) -> None:
+    device._stalled_sessions = stalled
+    assert device._rekey_after() == rekey_after
+
+
+async def test_run_stalled_sessions_back_off(
+    runner: Callable[[], AylaLanDevice],
+    fake_http: _FakeHttp,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A module that re-keys on every registration but never fetches."""
+    caplog.set_level(logging.DEBUG, logger="aioayla_lan")
+    monkeypatch.setattr("aioayla_lan.device.NOTIFY_TIMEOUT", 0.01)
+    monkeypatch.setattr("aioayla_lan.device.SESSION_TIMEOUT", 0.1)
+    monkeypatch.setattr("aioayla_lan.device.MAX_REKEY_INTERVAL", 0.4)
+    loop = asyncio.get_running_loop()
+    device = runner()
+    await fake_http.next_call()
+    mirror = device_side(device.handle_key_exchange(key_exchange_request()))
+    _commands(device, mirror)
+    keyed = loop.time()
+    # Reads only: a queued write re-keys sooner than the back-off.
+    device.request_properties(["power"])
+
+    gaps: list[float] = []
+    for _ in range(6):
+        *_, fresh = await fake_http.calls_until("POST")
+        gaps.append(fresh.at - keyed)
+        device.handle_key_exchange(key_exchange_request())
+        keyed = loop.time()
+        # A key exchange drops queued reads.
+        device.request_properties(["power"])
+
+    expected = [0.1, 0.1, 0.1, 0.2, 0.4, 0.4]
+    assert all(gap >= rekey - SLACK for gap, rekey in zip(gaps, expected, strict=True))
+    # Below the next step: no back-off too early, none past the cap.
+    assert all(gap < rekey + 0.1 for gap, rekey in zip(gaps, expected, strict=True))
+    assert [m for m in caplog.messages if "stalled" in m] == [
+        f"{DSN}: session stalled ({count} in a row), keying a new one"
+        for count in range(1, 7)
+    ]
+
+
+async def test_run_first_session_rekeyed_when_never_heard_from(
+    runner: Callable[[], AylaLanDevice],
+    fake_http: _FakeHttp,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A module that keys but never fetches or pushes is not notified forever."""
+    monkeypatch.setattr("aioayla_lan.device.NOTIFY_TIMEOUT", 0.02)
+    monkeypatch.setattr("aioayla_lan.device.SESSION_TIMEOUT", 0.1)
+    device = runner()
+    await fake_http.next_call()
+    device.handle_key_exchange(key_exchange_request())
+    keyed = asyncio.get_running_loop().time()
+    device.request_properties(["power"])
+
+    # Bounded: a session never heard from would otherwise get PUTs forever.
+    calls = [await fake_http.next_call() for _ in range(20)]
+    *ignored, fresh = calls[: [c.method for c in calls].index("POST") + 1]
+
+    assert {(c.method, c.notify) for c in ignored} == {("PUT", 1)}
+    assert len(ignored) >= 2
+    assert fresh.at - keyed >= 0.1 - SLACK
+    assert device.last_seen is None
+
+
+async def test_run_write_rekeys_despite_back_off(
+    runner: Callable[[], AylaLanDevice],
+    fake_http: _FakeHttp,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A write is not held back past its TTL by a backed-off re-key."""
+    caplog.set_level(logging.DEBUG, logger="aioayla_lan")
+    monkeypatch.setattr("aioayla_lan.device.NOTIFY_TIMEOUT", 0.02)
+    monkeypatch.setattr("aioayla_lan.device.SESSION_TIMEOUT", 0.1)
+    device = runner()
+    await fake_http.next_call()
+    device.handle_key_exchange(key_exchange_request())
+    keyed = asyncio.get_running_loop().time()
+    # Backed off to twice SESSION_TIMEOUT.
+    device._stalled_sessions = STALLED_SESSIONS
+    device.set_property("power", 1)
+
+    *ignored, fresh = await fake_http.calls_until("POST")
+
+    assert {(c.method, c.notify) for c in ignored} == {("PUT", 1)}
+    assert 0.1 - SLACK <= fresh.at - keyed < 0.2
+    assert fresh.notify == 1
+    assert [m for m in caplog.messages if "stalled" in m] == [
+        f"{DSN}: session stalled, keying a new one for a write"
+    ]
+    assert device._stalled_sessions == STALLED_SESSIONS
+
+
+async def test_run_write_rekey_waits_for_session_timeout(
+    runner: Callable[[], AylaLanDevice],
+    fake_http: _FakeHttp,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A write re-keys a stalled session at most once per SESSION_TIMEOUT."""
+    caplog.set_level(logging.DEBUG, logger="aioayla_lan")
+    monkeypatch.setattr("aioayla_lan.device.NOTIFY_TIMEOUT", 0.02)
+    # Far beyond the notifies collected below, so none may re-key.
+    monkeypatch.setattr("aioayla_lan.device.SESSION_TIMEOUT", 1.0)
+    device = runner()
+    await fake_http.next_call()
+    device.handle_key_exchange(key_exchange_request())
+    device._stalled_sessions = STALLED_SESSIONS
+    device.set_property("power", 1)
+
+    calls = [await fake_http.next_call() for _ in range(4)]
+
+    assert {(c.method, c.notify) for c in calls} == {("PUT", 1)}
+    assert [m for m in caplog.messages if "stalled" in m] == []
+    assert device._stalled_sessions == STALLED_SESSIONS
+
+
+async def test_run_stale_write_stops_rekeying(
+    runner: Callable[[], AylaLanDevice],
+    fake_http: _FakeHttp,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A fire-and-forget write past its TTL no longer overrides the back-off."""
+    caplog.set_level(logging.DEBUG, logger="aioayla_lan")
+    monkeypatch.setattr("aioayla_lan.device.NOTIFY_TIMEOUT", 0.02)
+    monkeypatch.setattr("aioayla_lan.device.SESSION_TIMEOUT", 0.1)
+    monkeypatch.setattr("aioayla_lan.device.WRITE_TTL", 0.15)
+    loop = asyncio.get_running_loop()
+    device = runner()
+    await fake_http.next_call()
+    device.handle_key_exchange(key_exchange_request())
+    # Backed off to twice SESSION_TIMEOUT.
+    device._stalled_sessions = STALLED_SESSIONS
+    device.set_property("power", 1)
+    # Keeps notifying once the write is gone, so the back-off still runs.
+    device.request_properties(["mode"])
+
+    await fake_http.calls_until("POST")
+    device.handle_key_exchange(key_exchange_request())
+    keyed = loop.time()
+    device.request_properties(["mode"])
+    *_, fresh = await fake_http.calls_until("POST")
+
+    assert fresh.at - keyed >= 0.2 - SLACK
+    assert [m for m in caplog.messages if "stalled" in m or "stale" in m] == [
+        f"{DSN}: session stalled, keying a new one for a write",
+        f"{DSN}: dropping stale write of power",
+        f"{DSN}: session stalled ({STALLED_SESSIONS + 1} in a row), keying a new one",
+    ]
+
+
+async def test_run_write_without_stalled_sessions_waits_for_silence(
+    runner: Callable[[], AylaLanDevice],
+    fake_http: _FakeHttp,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no stalled session yet, a write follows the normal silence rule."""
+    monkeypatch.setattr("aioayla_lan.device.NOTIFY_TIMEOUT", 0.02)
+    monkeypatch.setattr("aioayla_lan.device.SESSION_TIMEOUT", 0.1)
+    loop = asyncio.get_running_loop()
+    device = runner()
+    await fake_http.next_call()
+    mirror = device_side(device.handle_key_exchange(key_exchange_request()))
+    keyed = loop.time()
+    device.set_property("power", 1)
+
+    async def module() -> None:
+        # Pushing keeps it heard from, but it never fetches the write.
+        for seq_no in itertools.count():
+            await asyncio.sleep(0.02)
+            device.handle_datapoint(
+                mirror.encrypt_and_sign(
+                    {"seq_no": seq_no, "data": {"name": "power", "value": 0}}
+                )
+            )
+
+    pushing = asyncio.create_task(module())
+    try:
+        calls = [await fake_http.next_call() for _ in range(15)]
+    finally:
+        pushing.cancel()
+
+    # Well past SESSION_TIMEOUT since the key exchange, yet no re-key.
+    assert calls[-1].at - keyed >= 0.1 + 2 * SLACK
+    assert {(c.method, c.notify) for c in calls} == {("PUT", 1)}
+    assert device._stalled_sessions == 0
+
+
+async def test_run_drained_queue_resets_stalled_sessions(
+    runner: Callable[[], AylaLanDevice], fake_http: _FakeHttp
+) -> None:
+    device = runner()
+    await fake_http.next_call()
+    mirror = device_side(device.handle_key_exchange(key_exchange_request()))
+    device._stalled_sessions = STALLED_SESSIONS
+    device.set_property("power", 1)
+
+    assert (await fake_http.next_call()).notify == 1
+    _commands(device, mirror)
+    # Let the run loop see the queue drain.
+    await asyncio.sleep(0.01)
+
+    assert device._stalled_sessions == 0
+    assert device._rekey_after() == SESSION_TIMEOUT
+
+
 async def test_run_busy_module_is_not_registered_afresh(
     runner: Callable[[], AylaLanDevice],
     fake_http: _FakeHttp,
@@ -1244,6 +1526,27 @@ async def test_run_drops_session_after_session_timeout(
     assert re.search(rf"{DSN}: session lost, silent for \d+ s", caplog.text)
 
 
+async def test_run_registration_logs_status(
+    runner: Callable[[], AylaLanDevice],
+    fake_http: _FakeHttp,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG, logger="aioayla_lan")
+    fake_http.errors.extend([None, _http_error(500)])
+    device = runner()
+    await fake_http.next_call()
+    device.set_property("power", 1)
+    await fake_http.next_call()
+    # The fresh registration proves the failed PUT was handled, and so logged.
+    await fake_http.next_call()
+
+    assert [m for m in caplog.messages if "local_reg" in m] == [
+        f"{DSN}: POST local_reg notify=0: 200",
+        f"{DSN}: PUT local_reg notify=1: 500",
+        f"{DSN}: POST local_reg notify=1: 200",
+    ]
+
+
 @pytest.mark.parametrize(
     ("error", "logged"),
     [
@@ -1271,7 +1574,11 @@ async def test_run_registration_failure_logged(
     # The retry proves the failure was handled, and so logged.
     await fake_http.next_call()
 
-    assert caplog.messages == [f"{DSN}: registration failed: {logged}"]
+    # A transport error has no response, so no status line.
+    assert caplog.messages == [
+        f"{DSN}: registration failed: {logged}",
+        f"{DSN}: POST local_reg notify=1: 200",
+    ]
 
 
 async def test_run_failure_without_session_does_not_report(
@@ -1561,6 +1868,19 @@ def created_tasks(monkeypatch: pytest.MonkeyPatch) -> list[asyncio.Task[Any]]:
 
     monkeypatch.setattr(asyncio, "create_task", spy)
     return created
+
+
+async def test_register_resets_stalled_sessions(
+    fake_http: _FakeHttp, datapoints: list[Datapoint]
+) -> None:
+    device = await _registered(fake_http, datapoints)
+    device._stalled_sessions = STALLED_SESSIONS + 1
+
+    await device.register()
+    assert (await fake_http.next_call()).method == "POST"
+
+    assert device._stalled_sessions == 0
+    assert device._rekey_after() == SESSION_TIMEOUT
 
 
 async def test_wait_verified_rejects_key_without_waiting_for_timeout(
