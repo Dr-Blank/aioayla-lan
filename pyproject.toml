@@ -1,6 +1,6 @@
 [project]
 name = "aioayla-lan"
-version = "0.2.0"
+version = "0.2.1"
 description = "Async local control of Ayla Networks IoT modules over Ayla LAN mode"
 authors = [
     { name = "Dr-Blank", email = "64108942+Dr-Blank@users.noreply.github.com" },
