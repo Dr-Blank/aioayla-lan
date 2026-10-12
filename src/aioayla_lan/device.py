@@ -53,11 +53,19 @@ The module forgets a registration it has not heard from in keep_alive.
 STALLED_SESSIONS = 3
 """Stalled sessions in a row before re-keying backs off.
 
-A stalled session stops collecting with work queued; a new key exchange is the
-only thing that gets such a module fetching again.
+A stalled session stops collecting with work queued; a new key exchange gets
+such a module fetching again, at least for its first command.
 """
 MAX_REKEY_INTERVAL = 120.0
 """Longest silence before a stalled session is replaced, once backed off."""
+REST_AFTER_STALLS = 6
+"""Stalled sessions in a row before the module is left alone for a while."""
+REST_INTERVAL = 600.0
+"""How long a module that keeps stalling goes without registrations.
+
+Re-keying never got such a module collecting again; a spell in which no client
+reached it did.
+"""
 RETRY_INTERVAL = 2.0
 """Pace of heartbeat retries while the session may still be alive."""
 NOTIFY_TIMEOUT = 3.0
@@ -620,6 +628,9 @@ class AylaLanDevice:
                     return False
                 if self._silent_for() > self._rekey_after():
                     self._stalled_sessions += 1
+                    if self._stalled_sessions >= REST_AFTER_STALLS:
+                        await self._rest()
+                        return True
                     _LOGGER.debug(
                         "%s: session stalled (%d in a row), keying a new one",
                         self.dsn,
@@ -662,6 +673,18 @@ class AylaLanDevice:
                 return False
             self._collected.clear()
         return True
+
+    async def _rest(self) -> None:
+        """Stop registering, so the module drops us, then start over."""
+        _LOGGER.debug(
+            "%s: session stalled (%d in a row), leaving the module alone for %.0f s",
+            self.dsn,
+            self._stalled_sessions,
+            REST_INTERVAL,
+        )
+        self._drop_session()
+        self._stalled_sessions = 0
+        await asyncio.sleep(REST_INTERVAL)
 
     def _rekey_after(self) -> float:
         """Silence after which a stalled session is replaced, backing off."""

@@ -1157,6 +1157,8 @@ async def test_run_stalled_sessions_back_off(
     monkeypatch.setattr("aioayla_lan.device.NOTIFY_TIMEOUT", 0.01)
     monkeypatch.setattr("aioayla_lan.device.SESSION_TIMEOUT", 0.1)
     monkeypatch.setattr("aioayla_lan.device.MAX_REKEY_INTERVAL", 0.4)
+    # Past the stalls below: resting is tested on its own.
+    monkeypatch.setattr("aioayla_lan.device.REST_AFTER_STALLS", 100)
     loop = asyncio.get_running_loop()
     device = runner()
     await fake_http.next_call()
@@ -1182,6 +1184,41 @@ async def test_run_stalled_sessions_back_off(
     assert [m for m in caplog.messages if "stalled" in m] == [
         f"{DSN}: session stalled ({count} in a row), keying a new one"
         for count in range(1, 7)
+    ]
+
+
+async def test_run_rests_module_that_keeps_stalling(
+    runner: Callable[[], AylaLanDevice],
+    fake_http: _FakeHttp,
+    connection_changes: list[bool],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """After enough stalled sessions, nothing is sent until the rest is over."""
+    caplog.set_level(logging.DEBUG, logger="aioayla_lan")
+    monkeypatch.setattr("aioayla_lan.device.NOTIFY_TIMEOUT", 0.01)
+    monkeypatch.setattr("aioayla_lan.device.SESSION_TIMEOUT", 0.05)
+    monkeypatch.setattr("aioayla_lan.device.REST_AFTER_STALLS", 2)
+    monkeypatch.setattr("aioayla_lan.device.REST_INTERVAL", 0.3)
+    device = runner()
+    await fake_http.next_call()
+    device.handle_key_exchange(key_exchange_request())
+    device.request_properties(["power"])
+    await fake_http.calls_until("POST")
+    device.handle_key_exchange(key_exchange_request())
+    # A key exchange drops queued reads.
+    device.request_properties(["power"])
+
+    *stalled, fresh = await fake_http.calls_until("POST")
+
+    assert {(c.method, c.notify) for c in stalled} == {("PUT", 1)}
+    assert fresh.at - stalled[-1].at >= 0.3 - SLACK
+    assert fresh.notify == 1
+    assert connection_changes == [True, True, False]
+    assert device._stalled_sessions == 0
+    assert [m for m in caplog.messages if "stalled" in m] == [
+        f"{DSN}: session stalled (1 in a row), keying a new one",
+        f"{DSN}: session stalled (2 in a row), leaving the module alone for 0 s",
     ]
 
 

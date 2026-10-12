@@ -184,6 +184,22 @@ def test_datapoint_logged_with_status(
     ]
 
 
+def test_datapoint_logged_with_query(
+    server: AylaLanServer, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A reply to a read is told from a push by its query string."""
+    mirror = _key_exchange(server)
+    body = _body(mirror.encrypt_and_sign({"seq_no": 0, "data": DATAPOINT}))
+    caplog.set_level(logging.DEBUG, logger="aioayla_lan.server")
+
+    server.handle(
+        DEVICE_HOST, "POST", "property/datapoint.json", body, "cmd_id=7&status=200"
+    )
+
+    path = "property/datapoint.json?cmd_id=7&status=200"
+    assert caplog.messages == [f"{DSN}: POST {path}, {len(body)} bytes: 206"]
+
+
 def test_rejected_request_logged_with_status(
     server: AylaLanServer, caplog: pytest.LogCaptureFixture
 ) -> None:

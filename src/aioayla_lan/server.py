@@ -53,13 +53,20 @@ class AylaLanServer:
             del self._devices[host]
 
     def handle(
-        self, remote: str | None, method: str, path: str, body: bytes
+        self,
+        remote: str | None,
+        method: str,
+        path: str,
+        body: bytes,
+        query: str = "",
     ) -> tuple[int, Any]:
         """Handle one request. Returns (HTTP status, JSON-serialisable body).
 
         Reply with the status as given: 206 is what keeps the module fetching.
 
         `path` is relative to `/local_lan/`, for example `commands.json`.
+        `query` is the raw query string, only logged: a reply to a read
+        carries its `cmd_id` and `status` there.
         """
         if (
             remote is None
@@ -69,7 +76,13 @@ class AylaLanServer:
             return 403, {}
         status, reply = self._route(device, method, path, body)
         _LOGGER.debug(
-            "%s: %s %s, %d bytes: %s", device.dsn, method, path, len(body), status
+            "%s: %s %s%s, %d bytes: %s",
+            device.dsn,
+            method,
+            path,
+            f"?{query}" if query else "",
+            len(body),
+            status,
         )
         return status, reply
 
