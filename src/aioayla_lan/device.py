@@ -345,7 +345,11 @@ class AylaLanDevice:
             self._pending_since = None
         self.request_properties(self._prime)
         self._keyed_at = time.monotonic()
-        _LOGGER.debug("%s: session established", self.dsn)
+        _LOGGER.debug(
+            "%s: session established, module time %s",
+            self.dsn,
+            key_exchange["time_1"],
+        )
         if self._on_connection_change:
             self._on_connection_change(True)
         # Wrapped in {"key_exchange": ...} the device silently retries forever.

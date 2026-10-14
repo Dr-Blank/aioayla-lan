@@ -135,6 +135,16 @@ def test_key_exchange_reply_is_unwrapped(device: AylaLanDevice) -> None:
     assert device.last_seen is None
 
 
+def test_key_exchange_logs_module_time(
+    device: AylaLanDevice, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.DEBUG, logger="aioayla_lan")
+
+    device.handle_key_exchange(key_exchange_request(time_1=123456))
+
+    assert f"{DSN}: session established, module time 123456" in caplog.messages
+
+
 @pytest.mark.parametrize(
     "overrides",
     [
