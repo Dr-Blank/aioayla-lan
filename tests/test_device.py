@@ -8,11 +8,11 @@ import itertools
 import json
 import logging
 import re
-from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterable
 from contextlib import AbstractContextManager, nullcontext
 from enum import IntEnum
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiohttp
 import pytest
@@ -1571,6 +1571,202 @@ async def test_run_drops_session_after_session_timeout(
     assert not device.connected
     assert connection_changes == [True, False]
     assert re.search(rf"{DSN}: session lost, silent for \d+ s", caplog.text)
+
+
+def _probes(
+    monkeypatch: pytest.MonkeyPatch, device: AylaLanDevice, results: Iterable[bool]
+) -> list[float]:
+    """Replace the reachability probe. Returns when each probe ran."""
+    results = iter(results)
+    probed: list[float] = []
+
+    async def reachable() -> bool:
+        assert device.settling
+        probed.append(asyncio.get_running_loop().time())
+        return next(results)
+
+    monkeypatch.setattr(device, "_reachable", reachable)
+    return probed
+
+
+async def _calls_for(fake_http: _FakeHttp, seconds: float) -> list[_Registration]:
+    calls = [await fake_http.next_call()]
+    while calls[-1].at - calls[0].at < seconds:
+        calls.append(await fake_http.next_call())
+    return calls
+
+
+@pytest.fixture
+def fast_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("aioayla_lan.device.HEARTBEAT_INTERVAL", 0.05)
+    monkeypatch.setattr("aioayla_lan.device.SESSION_TIMEOUT", 0.1)
+    monkeypatch.setattr("aioayla_lan.device.RETRY_INTERVAL", 0.01)
+    monkeypatch.setattr("aioayla_lan.device.PROBE_INTERVAL", 0.01)
+
+
+@pytest.mark.usefixtures("fast_retries")
+async def test_run_settles_after_module_restart(
+    runner: Callable[[], AylaLanDevice],
+    fake_http: _FakeHttp,
+    connection_changes: list[bool],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A module that went away is left alone until it answers, then for a while."""
+    caplog.set_level(logging.DEBUG, logger="aioayla_lan")
+    device = runner()
+    device.restart_settle = 0.3
+    probed = _probes(monkeypatch, device, [False, False, True])
+    await fake_http.next_call()
+    device.handle_key_exchange(key_exchange_request())
+    fake_http.failing["PUT"] = aiohttp.ClientConnectionError("refused")
+    device.set_property("power", 1)
+
+    *retries, fresh = await fake_http.calls_until("POST")
+
+    assert {c.method for c in retries} == {"PUT"}
+    assert len(probed) == 3
+    assert fresh.at - probed[-1] >= 0.3 - SLACK
+    assert connection_changes == [True, False]
+    assert not device.settling
+    assert [m for m in caplog.messages if "reachable" in m] == [
+        f"{DSN}: unreachable, waiting for it to come back",
+        f"{DSN}: reachable again, registering in 0 s",
+    ]
+
+
+@pytest.mark.usefixtures("fast_retries")
+async def test_run_logs_module_that_stays_unreachable(
+    runner: Callable[[], AylaLanDevice],
+    fake_http: _FakeHttp,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG, logger="aioayla_lan")
+    monkeypatch.setattr("aioayla_lan.device.PROBE_LOG_INTERVAL", 0.05)
+    device = runner()
+    device.restart_settle = 0.01
+    probed = _probes(monkeypatch, device, [*[False] * 10, True])
+    await fake_http.next_call()
+    device.handle_key_exchange(key_exchange_request())
+    fake_http.failing["PUT"] = aiohttp.ClientConnectionError("refused")
+    device.set_property("power", 1)
+
+    await fake_http.calls_until("POST")
+
+    assert len(probed) == 11
+    assert any(
+        re.fullmatch(rf"{DSN}: still unreachable after \d+ s", m)
+        for m in caplog.messages
+    )
+
+
+@pytest.mark.usefixtures("fast_retries")
+async def test_run_settles_once_per_lost_session(
+    runner: Callable[[], AylaLanDevice],
+    fake_http: _FakeHttp,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A registration that fails right after the settle does not start another."""
+    device = runner()
+    device.restart_settle = 0.3
+    probed = _probes(monkeypatch, device, itertools.repeat(True))
+    await fake_http.next_call()
+    device.handle_key_exchange(key_exchange_request())
+    fake_http.failing["PUT"] = aiohttp.ClientConnectionError("refused")
+    fake_http.failing["POST"] = TimeoutError()
+    device.set_property("power", 1)
+    await fake_http.calls_until("POST")
+
+    posts = await _calls_for(fake_http, 0.4)
+
+    assert {c.method for c in posts} == {"POST"}
+    assert max(b.at - a.at for a, b in itertools.pairwise(posts)) < 0.3
+    assert len(probed) == 1
+
+
+@pytest.mark.parametrize(
+    ("settle", "error"),
+    [
+        pytest.param(0.0, aiohttp.ClientConnectionError("refused"), id="no-settle"),
+        pytest.param(
+            0.3,
+            aiohttp.ClientResponseError(MagicMock(), (), status=500),
+            id="module-answered",
+        ),
+    ],
+)
+@pytest.mark.usefixtures("fast_retries")
+async def test_run_registers_at_once_without_restart_settle(
+    runner: Callable[[], AylaLanDevice],
+    fake_http: _FakeHttp,
+    monkeypatch: pytest.MonkeyPatch,
+    settle: float,
+    error: BaseException,
+) -> None:
+    device = runner()
+    device.restart_settle = settle
+    probed = _probes(monkeypatch, device, itertools.repeat(True))
+    await fake_http.next_call()
+    device.handle_key_exchange(key_exchange_request())
+    fake_http.failing["PUT"] = error
+    fake_http.failing["POST"] = error
+    device.set_property("power", 1)
+
+    # Well past SESSION_TIMEOUT, at heartbeat pace or faster.
+    calls = await _calls_for(fake_http, 0.25)
+
+    assert max(b.at - a.at for a, b in itertools.pairwise(calls)) < 0.3
+    assert probed == []
+
+
+@pytest.mark.usefixtures("fast_retries")
+async def test_run_never_keyed_module_registers_at_once(
+    runner: Callable[[], AylaLanDevice],
+    fake_http: _FakeHttp,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no session yet there is no restart to settle after."""
+    device = runner()
+    device.restart_settle = 0.3
+    probed = _probes(monkeypatch, device, itertools.repeat(True))
+    fake_http.failing["POST"] = aiohttp.ClientConnectionError("refused")
+
+    calls = await _calls_for(fake_http, 0.25)
+
+    assert max(b.at - a.at for a, b in itertools.pairwise(calls)) < 0.3
+    assert probed == []
+
+
+@pytest.mark.parametrize(
+    ("connect", "expected"),
+    [
+        pytest.param(None, True, id="accepted"),
+        pytest.param(OSError("refused"), False, id="refused"),
+        pytest.param(TimeoutError(), False, id="timeout"),
+    ],
+)
+async def test_reachable_probes_tcp_without_registering(
+    device: AylaLanDevice,
+    monkeypatch: pytest.MonkeyPatch,
+    connect: BaseException | None,
+    expected: bool,
+) -> None:
+    writer = MagicMock()
+    writer.wait_closed = AsyncMock()
+    calls: list[tuple[str, int]] = []
+
+    async def open_connection(host: str, port: int) -> tuple[MagicMock, MagicMock]:
+        calls.append((host, port))
+        if connect is not None:
+            raise connect
+        return MagicMock(), writer
+
+    monkeypatch.setattr("asyncio.open_connection", open_connection)
+
+    assert await device._reachable() is expected
+    assert calls == [(DEVICE_HOST, 80)]
+    assert writer.close.called is expected
 
 
 async def test_run_registration_logs_status(

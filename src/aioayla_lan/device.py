@@ -9,6 +9,7 @@ Answering any of its requests with 206 Partial Content makes it fetch
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import secrets
@@ -68,6 +69,10 @@ reached it did.
 """
 RETRY_INTERVAL = 2.0
 """Pace of heartbeat retries while the session may still be alive."""
+PROBE_INTERVAL = 5.0
+"""Pace of reachability probes while a module that went away restarts."""
+PROBE_LOG_INTERVAL = 60.0
+"""How often a module that stays unreachable is logged while probing."""
 NOTIFY_TIMEOUT = 3.0
 """Wait for a notified module to fetch before notifying again.
 
@@ -87,6 +92,8 @@ REJECTED_KEY_EXCHANGES = 3
 A module that cannot validate our replies re-keys on every registration.
 """
 LAN_URI = "/local_lan"
+HTTP_PORT = 80
+"""The module's HTTP port; `host` is a bare address."""
 _ALPHABET = string.ascii_letters + string.digits
 
 
@@ -175,8 +182,13 @@ class AylaLanDevice:
         on_datapoint: Callable[[Datapoint], None],
         on_connection_change: Callable[[bool], None] | None = None,
         prime_properties: Iterable[str] = (),
+        restart_settle: float = 0.0,
     ) -> None:
-        """Initialise; call :meth:`run` to start registering."""
+        """Initialise; call :meth:`run` to start registering.
+
+        `restart_settle` is how long to wait, once a module that went away
+        answers again, before registering with it. 0 registers at once.
+        """
         self._http = session
         self.host = host
         self.dsn = dsn
@@ -187,6 +199,8 @@ class AylaLanDevice:
         self._on_datapoint = on_datapoint
         self._on_connection_change = on_connection_change
         self._prime = tuple(prime_properties)
+        self.restart_settle = restart_settle
+        self._settling = False
 
         self._crypto: SessionCrypto | None = None
         self._cmd_seq = 0
@@ -217,6 +231,11 @@ class AylaLanDevice:
     def key_id(self) -> int | None:
         """The LAN key id, learned from the device when not supplied."""
         return self._key_id
+
+    @property
+    def settling(self) -> bool:
+        """Whether registering is held back after the module went away."""
+        return self._settling
 
     @property
     def pending(self) -> bool:
@@ -496,15 +515,17 @@ class AylaLanDevice:
         self._authenticated.set()
         self._touch()
 
-    def _drop_session(self) -> None:
+    def _drop_session(self) -> bool:
+        """End the session. Returns whether there was one."""
         if self._crypto is None:
-            return
+            return False
         self._crypto = None
         _LOGGER.debug(
             "%s: session lost, silent for %.0f s", self.dsn, self._silent_for()
         )
         if self._on_connection_change:
             self._on_connection_change(False)
+        return True
 
     async def register(self) -> None:
         """Register once, asking the module to dial back now.
@@ -611,11 +632,15 @@ class AylaLanDevice:
             await self._register(first, notify)
         except (aiohttp.ClientError, TimeoutError) as err:
             _LOGGER.debug("%s: registration failed: %r", self.dsn, err)
-            if isinstance(err, aiohttp.ClientResponseError) and not first:
+            answered = isinstance(err, aiohttp.ClientResponseError)
+            if answered and not first:
                 # The module forgot us: register afresh straight away.
                 return True
             if time.monotonic() - self._last_contact() > SESSION_TIMEOUT:
-                self._drop_session()
+                # Settled at most once per session lost.
+                if self._drop_session() and self.restart_settle and not answered:
+                    await self._settle()
+                    return True
                 first = True
             elif self.connected:
                 # One lost heartbeat does not end the session.
@@ -689,6 +714,43 @@ class AylaLanDevice:
         self._drop_session()
         self._stalled_sessions = 0
         await asyncio.sleep(REST_INTERVAL)
+
+    async def _settle(self) -> None:
+        """Wait until the module answers again, then for `restart_settle`."""
+        self._settling = True
+        try:
+            _LOGGER.debug("%s: unreachable, waiting for it to come back", self.dsn)
+            started = logged = time.monotonic()
+            while not await self._reachable():
+                if time.monotonic() - logged >= PROBE_LOG_INTERVAL:
+                    logged = time.monotonic()
+                    _LOGGER.debug(
+                        "%s: still unreachable after %.0f s",
+                        self.dsn,
+                        logged - started,
+                    )
+                await asyncio.sleep(PROBE_INTERVAL)
+            _LOGGER.debug(
+                "%s: reachable again, registering in %.0f s",
+                self.dsn,
+                self.restart_settle,
+            )
+            await asyncio.sleep(self.restart_settle)
+        finally:
+            self._settling = False
+
+    async def _reachable(self) -> bool:
+        """Whether the module accepts a TCP connection, without registering."""
+        try:
+            _, writer = await asyncio.wait_for(
+                asyncio.open_connection(self.host, HTTP_PORT), REGISTER_TIMEOUT
+            )
+        except (OSError, TimeoutError):
+            return False
+        writer.close()
+        with contextlib.suppress(OSError):
+            await writer.wait_closed()
+        return True
 
     def _rekey_after(self) -> float:
         """Silence after which a stalled session is replaced, backing off."""
