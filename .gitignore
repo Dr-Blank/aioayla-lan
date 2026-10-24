@@ -1,14 +1,29 @@
 __pycache__/
 *.py[cod]
+*.so
+build/
+dist/
+*.egg-info/
 .venv/
 .mypy_cache/
 .ruff_cache/
 .pytest_cache/
 .coverage
 coverage.xml
-dist/
-build/
-*.egg-info/
+htmlcov/
+
+# Editor settings are personal; shared formatting lives in .editorconfig and
+# the tool configuration in pyproject.toml.
+.idea/
+# .vscode/* rather than .vscode/, so the shared files below can be re-included.
+# Git cannot un-ignore a file inside an ignored directory.
+.vscode/*
+!.vscode/extensions.json
+!.vscode/tasks.json
+*.swp
+.DS_Store
+
+.env
 
 # Per-device secret: grants full local control of the unit.
 lanip_key.json

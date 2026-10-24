@@ -1,0 +1,18 @@
+{
+  "recommendations": [
+    // VS Code does not read .editorconfig natively, and this repo relies on it.
+    "editorconfig.editorconfig",
+    "ms-python.python",
+    "ms-python.vscode-pylance",
+    // The gates that also run in prek and CI.
+    "charliermarsh.ruff",
+    "ms-python.mypy-type-checker",
+    "tamasfe.even-better-toml"
+  ],
+  // ruff replaces all three, so having them installed only causes formatter fights.
+  "unwantedRecommendations": [
+    "ms-python.black-formatter",
+    "ms-python.isort",
+    "ms-python.flake8"
+  ]
+}

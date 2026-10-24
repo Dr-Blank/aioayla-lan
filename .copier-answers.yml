@@ -1,0 +1,14 @@
+# Changes here will be overwritten by Copier; NEVER EDIT MANUALLY
+_commit: v1.4.0
+_src_path: https://github.com/Dr-Blank/ha-integration-ci
+description: Async local control of Ayla Networks IoT modules over Ayla LAN mode
+license: Apache-2.0
+mypy_untyped_modules: []
+package: aioayla_lan
+project_type: library
+pylint: false
+python_versions:
+- '3.12'
+- '3.13'
+- '3.14'
+repo_name: aioayla-lan

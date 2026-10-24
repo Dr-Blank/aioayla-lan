@@ -47,6 +47,7 @@ if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
   exit 1
 fi
 
+
 # An explicit version that is already the current one leaves nothing to commit,
 # which is how an existing version gets its first tag.
 if [ -n "$(git status --porcelain -- "${files[@]}")" ]; then

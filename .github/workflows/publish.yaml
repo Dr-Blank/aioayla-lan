@@ -17,67 +17,17 @@ concurrency:
   group: publish-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
-env:
-  TAG: ${{ inputs.tag || github.ref_name }}
-
 jobs:
-  verify:
-    name: Verify
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ env.TAG }}
-          persist-credentials: false
-
-      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
-        with:
-          python-version: "3.14"
-          enable-cache: true
-
-      - name: Verify pyproject version matches tag
-        run: |
-          version="v$(uv version --short)"
-          if [ "$TAG" != "$version" ]; then
-            echo "::error::tag $TAG does not match pyproject.toml version $version"
-            exit 1
-          fi
-
-      - name: Install dependencies
-        run: uv sync --locked --all-extras --dev
-
-      - name: Lint
-        run: uv run --no-sync prek run --all-files --show-diff-on-failure
-
-      - name: Test
-        run: uv run pytest
-
   build:
-    name: Build
-    needs: [verify]
-    runs-on: ubuntu-latest
     permissions:
       contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ env.TAG }}
-          persist-credentials: false
+    uses: Dr-Blank/ha-integration-ci/.github/workflows/library-build.yaml@8bb8dd71791ffd3f07acbb90fea6ecbd63a03683 # v1.3.0
+    with:
+      tag: ${{ inputs.tag || github.ref_name }}
+      python-version: "3.14"
 
-      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
-        with:
-          enable-cache: true
-
-      - name: Build package
-        run: uv build
-
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: dist
-          path: dist/
-
+  # PyPI trusted publishing names this workflow file and environment, so the
+  # upload cannot move into the shared workflow.
   publish:
     name: Publish to PyPI
     needs: [build]
@@ -101,35 +51,10 @@ jobs:
           skip-existing: true
 
   github-release:
-    name: GitHub release
     needs: [build, publish]
-    runs-on: ubuntu-latest
     permissions:
       contents: write
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ env.TAG }}
-          fetch-depth: 0
-          persist-credentials: false
-
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: dist
-          path: dist/
-
-      - name: Create or update the GitHub release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "release $TAG already exists, refreshing its assets"
-            gh release upload "$TAG" dist/* --clobber
-            exit 0
-          fi
-          ./script/release_notes.sh "$TAG" > "$RUNNER_TEMP/notes.md"
-          gh release create "$TAG" dist/* \
-            --title "$TAG" \
-            --notes-file "$RUNNER_TEMP/notes.md" \
-            --generate-notes \
-            --verify-tag
+    uses: Dr-Blank/ha-integration-ci/.github/workflows/github-release.yaml@8bb8dd71791ffd3f07acbb90fea6ecbd63a03683 # v1.3.0
+    with:
+      tag: ${{ inputs.tag || github.ref_name }}
+      artifact: dist

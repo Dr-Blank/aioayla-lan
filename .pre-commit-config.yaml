@@ -25,3 +25,11 @@ repos:
         language: system
         types_or: [python, pyi]
         pass_filenames: false
+      # Too slow for every commit; CI runs it with --hook-stage manual.
+      - id: pytest
+        name: pytest
+        entry: uv run --no-sync pytest
+        language: system
+        types: [python]
+        pass_filenames: false
+        stages: [pre-push, manual]
