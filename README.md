@@ -13,6 +13,7 @@ Values are passed through uninterpreted. What a property means is up to the call
 - **Read back after a write.** Modules do not reliably echo what they were sent, nor what a write changed elsewhere.
 - **One command per payload.** A module may ignore a batched `cmds` array and re-key.
 - **Queue semantics.** Writes go before reads. A newer write to a queued name replaces it, and a repeated read is asked once.
+- **Pass the query string to `AylaLanServer.handle`.** The module answers a read by posting its value with `?cmd_id=N&status=S`. A read stays queued until that answer arrives, whatever its status, and is handed out again until then, at most 3 times. Without the query string every read is handed out 3 times.
 - **Session.** Heartbeat every 10 s, a third of the module's `keep_alive`. One failed heartbeat does not drop the session; 30 s without contact does. A module that accepts notifies but stops dialling back for 30 s is registered afresh, which makes it key-exchange again.
 - **One LAN client at a time, and no cloud client writing `refresh`.** A cloud-side `refresh` makes some modules push their whole catalogue for minutes, during which they collect no commands.
 - **Expect malformed requests on the callback port.** Some firmware leaks its cloud echo onto the LAN socket; the server rejecting it loses the ack of the write before it, though the write was applied.

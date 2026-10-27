@@ -53,12 +53,29 @@ def _fetch(server: AylaLanServer) -> tuple[int, Any]:
     return server.handle(DEVICE_HOST, "GET", "commands.json", b"")
 
 
+def _collect(server: AylaLanServer, mirror: SessionCrypto) -> tuple[int, Any]:
+    """Fetch the next read and answer it. Returns the fetch's status and body."""
+    status, payload = _fetch(server)
+    # Decrypted so the mirror's CBC chain keeps up.
+    body = mirror.decrypt_and_validate(payload)
+    cmd = body["data"]["cmds"][0]["cmd"]
+    name = cmd["resource"].removeprefix("property.json?name=")
+    answer = mirror.encrypt_and_sign({"seq_no": 0, "data": {"name": name}})
+    server.handle(
+        DEVICE_HOST,
+        "POST",
+        "property/datapoint.json",
+        _body(answer),
+        f"cmd_id={cmd['cmd_id']}&status=200",
+    )
+    return status, body
+
+
 def _drained(server: AylaLanServer) -> SessionCrypto:
-    """Key exchange, then let the module collect the primed reads."""
+    """Key exchange, then let the module answer the primed reads."""
     mirror = _key_exchange(server)
     for _ in PRIME:
-        # Decrypted so the mirror's CBC chain keeps up.
-        mirror.decrypt_and_validate(_fetch(server)[1])
+        _collect(server, mirror)
     return mirror
 
 
@@ -116,12 +133,14 @@ def test_key_exchange_returns_unwrapped_reply(
 
 def test_get_commands_after_session(server: AylaLanServer) -> None:
     mirror = _key_exchange(server)
-    replies = [_fetch(server) for _ in range(len(PRIME) + 1)]
-    # 206 while commands remain, so the module fetches again without a notify.
-    assert [status for status, _ in replies] == [206] * (len(PRIME) - 1) + [200, 200]
-    assert [mirror.decrypt_and_validate(p)["seq_no"] for _, p in replies] == list(
-        range(len(PRIME) + 1)
-    )
+    replies = [_collect(server, mirror) for _ in PRIME]
+    status, payload = _fetch(server)
+    # 206 while commands remain, including a read not yet answered, so the
+    # module fetches again without a notify.
+    assert [status for status, _ in replies] + [status] == [206] * len(PRIME) + [200]
+    assert [body["seq_no"] for _, body in replies] + [
+        mirror.decrypt_and_validate(payload)["seq_no"]
+    ] == list(range(len(PRIME) + 1))
 
 
 def test_get_commands_partial_while_write_queued(
@@ -137,7 +156,7 @@ def test_get_commands_partial_while_write_queued(
     ("fetches", "status"),
     [
         pytest.param(0, 206, id="more-queued"),
-        pytest.param(len(PRIME) - 1, 200, id="last"),
+        pytest.param(len(PRIME) - 1, 206, id="last"),
         pytest.param(len(PRIME), 200, id="empty"),
     ],
 )
@@ -147,9 +166,9 @@ def test_get_commands_logged_with_status(
     fetches: int,
     status: int,
 ) -> None:
-    _key_exchange(server)
+    mirror = _key_exchange(server)
     for _ in range(fetches):
-        _fetch(server)
+        _collect(server, mirror)
     caplog.set_level(logging.DEBUG, logger="aioayla_lan.server")
 
     assert _fetch(server)[0] == status
@@ -171,7 +190,7 @@ def test_datapoint_logged_with_status(
 ) -> None:
     mirror = _key_exchange(server)
     for _ in range(fetches):
-        _fetch(server)
+        _collect(server, mirror)
     body = _body(mirror.encrypt_and_sign({"seq_no": 0, "data": DATAPOINT}))
     caplog.set_level(logging.DEBUG, logger="aioayla_lan.server")
 
@@ -198,6 +217,43 @@ def test_datapoint_logged_with_query(
 
     path = "property/datapoint.json?cmd_id=7&status=200"
     assert caplog.messages == [f"{DSN}: POST {path}, {len(body)} bytes: 206"]
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        pytest.param("", id="push"),
+        pytest.param("echo=true", id="echo"),
+        pytest.param("cmd_id=x&status=200", id="cmd-id-not-int"),
+        pytest.param("status=200", id="no-cmd-id"),
+    ],
+)
+def test_datapoint_without_read_cmd_id_keeps_read(
+    server: AylaLanServer, query: str
+) -> None:
+    mirror = _key_exchange(server)
+    first = mirror.decrypt_and_validate(_fetch(server)[1])
+    body = _body(mirror.encrypt_and_sign({"seq_no": 0, "data": DATAPOINT}))
+
+    server.handle(DEVICE_HOST, "POST", "property/datapoint.json", body, query)
+
+    assert mirror.decrypt_and_validate(_fetch(server)[1])["data"] == first["data"]
+
+
+def test_read_answered_through_server(server: AylaLanServer) -> None:
+    mirror = _key_exchange(server)
+    first = mirror.decrypt_and_validate(_fetch(server)[1])
+    body = _body(mirror.encrypt_and_sign({"seq_no": 0, "data": DATAPOINT}))
+    cmd_id = first["data"]["cmds"][0]["cmd"]["cmd_id"]
+
+    server.handle(
+        DEVICE_HOST, "POST", "property/datapoint.json", body, f"cmd_id={cmd_id}"
+    )
+
+    second = mirror.decrypt_and_validate(_fetch(server)[1])
+    assert second["data"]["cmds"][0]["cmd"]["resource"] == (
+        f"property.json?name={PRIME[1]}"
+    )
 
 
 def test_rejected_request_logged_with_status(
@@ -261,6 +317,7 @@ def test_datapoint_fires_callback(
     server: AylaLanServer, datapoints: list[Datapoint]
 ) -> None:
     mirror = _drained(server)
+    datapoints.clear()
     payload = mirror.encrypt_and_sign(
         {"seq_no": 0, "data": {"name": "power", "value": 1, "base_type": "boolean"}}
     )
@@ -298,7 +355,7 @@ def test_encrypted_post_status_follows_queue(
 ) -> None:
     mirror = _key_exchange(server)
     for _ in range(fetches):
-        _fetch(server)
+        _collect(server, mirror)
     payload = mirror.encrypt_and_sign({"seq_no": 0, "data": data})
     assert server.handle(DEVICE_HOST, "POST", path, _body(payload)) == (status, {})
 
@@ -318,6 +375,7 @@ async def test_write_acknowledged_through_server(
     expected: type[object],
 ) -> None:
     mirror = _drained(server)
+    datapoints.clear()
     write = asyncio.create_task(device.async_set_property("power", 1))
     await asyncio.sleep(0)
 
@@ -490,6 +548,7 @@ def test_undecodable_datapoint_skipped_session_kept(
     server: AylaLanServer, datapoints: list[Datapoint]
 ) -> None:
     mirror = _drained(server)
+    datapoints.clear()
     # UTY-TFSXW1 answers a read of a property it lacks like this. A 400 made it
     # re-key and the read restart, forever.
     with patch.object(json, "dumps", return_value='{"seq_no":28,"data":{}'):
@@ -512,9 +571,14 @@ def test_undecodable_reply_keeps_reads_going(server: AylaLanServer) -> None:
     with patch.object(json, "dumps", return_value='{"seq_no":28,"data":{}'):
         undecodable = mirror.encrypt_and_sign(None)
 
-    # Reads remain, so the module is told to fetch again rather than re-key.
+    # It answers the read, and reads remain, so the module is told to fetch the
+    # next one rather than re-key.
     assert server.handle(
-        DEVICE_HOST, "POST", "property/datapoint.json", _body(undecodable)
+        DEVICE_HOST,
+        "POST",
+        "property/datapoint.json",
+        _body(undecodable),
+        f"cmd_id={first['data']['cmds'][0]['cmd']['cmd_id']}&status=200",
     ) == (206, {})
     second = mirror.decrypt_and_validate(_fetch(server)[1])
     assert [body["data"]["cmds"][0]["cmd"]["resource"] for body in (first, second)] == [

@@ -86,6 +86,12 @@ a reboot can take longer, and a property without acks enabled is never acked.
 """
 WRITE_TTL = 30.0
 """Age at which an uncollected write is dropped rather than applied late."""
+READ_SERVES = 3
+"""Times a read is handed out before it is dropped unanswered.
+
+A read stays queued until the module posts its value with the read's `cmd_id`,
+which it does before it fetches again.
+"""
 REJECTED_KEY_EXCHANGES = 3
 """Unauthenticated key exchanges before the key counts as rejected.
 
@@ -164,6 +170,12 @@ class _Write:
         self.futures.clear()
 
 
+@dataclass
+class _Read:
+    cmd_id: int
+    serves: int = 0
+
+
 class AylaLanDevice:
     """Local session with one Ayla module.
 
@@ -206,9 +218,10 @@ class AylaLanDevice:
         self._cmd_seq = 0
         self._cmd_id = 1
         # By name, in the order they go out: a newer write to a name replaces
-        # the queued one and a repeated read is asked once.
+        # the queued one and a repeated read is asked once. A read gets its
+        # `_Read` when first handed out.
         self._writes: dict[str, _Write] = {}
-        self._reads: dict[str, None] = {}
+        self._reads: dict[str, _Read | None] = {}
         self._unacked: dict[str, _Write] = {}
         self._pending_since: float | None = None
         self._wake = asyncio.Event()
@@ -313,7 +326,8 @@ class AylaLanDevice:
 
     def request_properties(self, names: Iterable[str]) -> None:
         """Queue property reads; values arrive through `on_datapoint`."""
-        self._reads.update(dict.fromkeys(names))
+        for name in names:
+            self._reads.setdefault(name, None)
         self._queued()
 
     def _queued(self) -> None:
@@ -397,15 +411,14 @@ class AylaLanDevice:
                 write.timer = asyncio.get_running_loop().call_later(
                     ACK_TIMEOUT, self._ack_timed_out, write.id
                 )
-        elif self._reads:
-            name = next(iter(self._reads))
-            del self._reads[name]
-            data = self._read_command(name)
+        elif (head := self._next_read()) is not None:
+            name, read = head
+            data = self._read_command(name, read.cmd_id)
             _LOGGER.debug(
                 "%s: sending read of %s (cmd_id %s, seq %s)",
                 self.dsn,
                 name,
-                data["cmds"][0]["cmd"]["cmd_id"],
+                read.cmd_id,
                 self._cmd_seq,
             )
         else:
@@ -418,8 +431,50 @@ class AylaLanDevice:
         self._collected.set()
         return self._crypto.encrypt_and_sign(body)
 
-    def _read_command(self, name: str) -> dict[str, Any]:
-        cmd_id, self._cmd_id = self._cmd_id, self._cmd_id + 1
+    def _next_read(self) -> tuple[str, _Read] | None:
+        """The read to hand out next; it stays queued until answered."""
+        while self._reads:
+            name = next(iter(self._reads))
+            if (read := self._reads[name]) is None:
+                read = self._reads[name] = _Read(self._cmd_id)
+                self._cmd_id += 1
+            elif read.serves >= READ_SERVES:
+                _LOGGER.debug(
+                    "%s: dropping read of %s (cmd_id %s), never answered",
+                    self.dsn,
+                    name,
+                    read.cmd_id,
+                )
+                del self._reads[name]
+                continue
+            read.serves += 1
+            return name, read
+        return None
+
+    def _read_answered(self, cmd_id: int | None, status: int | None) -> None:
+        if cmd_id is None:
+            return
+        name = next(
+            (
+                name
+                for name, read in self._reads.items()
+                if read is not None and read.cmd_id == cmd_id
+            ),
+            None,
+        )
+        if name is None:
+            _LOGGER.debug("%s: answer to no queued read (cmd_id %s)", self.dsn, cmd_id)
+            return
+        del self._reads[name]
+        if status != 200:
+            _LOGGER.debug(
+                "%s: read of %s answered with status %s", self.dsn, name, status
+            )
+        if not self.pending:
+            self._pending_since = None
+        self._collected.set()
+
+    def _read_command(self, name: str, cmd_id: int) -> dict[str, Any]:
         return {
             "cmds": [
                 {
@@ -460,8 +515,16 @@ class AylaLanDevice:
                 )
             )
 
-    def handle_datapoint(self, doc: dict[str, Any]) -> None:
-        """Decrypt a pushed property value and report it."""
+    def handle_datapoint(
+        self,
+        doc: dict[str, Any],
+        cmd_id: int | None = None,
+        status: int | None = None,
+    ) -> None:
+        """Decrypt a pushed property value and report it.
+
+        `cmd_id` and `status` come from the query string of a reply to a read.
+        """
         if self._crypto is None:
             raise NoSessionError
         try:
@@ -470,13 +533,16 @@ class AylaLanDevice:
         # here. Skipped, not refused: a refusal makes the module re-key and resend.
         except json.JSONDecodeError as err:
             self._contact()
+            self._read_answered(cmd_id, status)
             _LOGGER.debug("%s: undecodable payload: %r", self.dsn, err.doc)
             return
         except UnicodeDecodeError as err:
             self._contact()
+            self._read_answered(cmd_id, status)
             _LOGGER.debug("%s: undecodable payload: %r", self.dsn, err.object)
             return
         self._contact()
+        self._read_answered(cmd_id, status)
         data = update.get("data") if isinstance(update, dict) else None
         if isinstance(data, dict) and "ack_status" in data:
             self._handle_ack(data)

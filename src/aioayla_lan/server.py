@@ -12,6 +12,7 @@ makes the module fetch `commands.json` again without another notify.
 import ipaddress
 import json
 import logging
+import urllib.parse
 from typing import Any
 
 from .device import AylaLanDevice
@@ -29,6 +30,19 @@ def _normalize_ip(address: str) -> str:
     if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
         return str(ip.ipv4_mapped)
     return str(ip)
+
+
+def _read_reply(query: str) -> tuple[int | None, int | None]:
+    """The `cmd_id` and `status` a reply to a read carries, if parseable."""
+    params = urllib.parse.parse_qs(query)
+    return _int_param(params, "cmd_id"), _int_param(params, "status")
+
+
+def _int_param(params: dict[str, list[str]], name: str) -> int | None:
+    try:
+        return int(params[name][0])
+    except (KeyError, ValueError):
+        return None
 
 
 def _more(device: AylaLanDevice) -> int:
@@ -65,8 +79,8 @@ class AylaLanServer:
         Reply with the status as given: 206 is what keeps the module fetching.
 
         `path` is relative to `/local_lan/`, for example `commands.json`.
-        `query` is the raw query string, only logged: a reply to a read
-        carries its `cmd_id` and `status` there.
+        `query` is the raw query string: a reply to a read carries its
+        `cmd_id` and `status` there.
         """
         if (
             remote is None
@@ -74,7 +88,7 @@ class AylaLanServer:
         ):
             _LOGGER.debug("rejecting callback from unknown address %s", remote)
             return 403, {}
-        status, reply = self._route(device, method, path, body)
+        status, reply = self._route(device, method, path, body, query)
         _LOGGER.debug(
             "%s: %s %s%s, %d bytes: %s",
             device.dsn,
@@ -87,7 +101,7 @@ class AylaLanServer:
         return status, reply
 
     def _route(
-        self, device: AylaLanDevice, method: str, path: str, body: bytes
+        self, device: AylaLanDevice, method: str, path: str, body: bytes, query: str
     ) -> tuple[int, Any]:
         if method == "GET":
             if not path.endswith("commands.json"):
@@ -109,7 +123,7 @@ class AylaLanServer:
             if "key_exchange" in doc:
                 return 200, device.handle_key_exchange(doc["key_exchange"])
             if "enc" in doc:
-                device.handle_datapoint(doc)
+                device.handle_datapoint(doc, *_read_reply(query))
                 return _more(device), {}
         except AylaLanError as err:
             _LOGGER.warning("%s: %s on %s", device.dsn, type(err).__name__, path)

@@ -47,6 +47,7 @@ from aioayla_lan import (
 )
 from aioayla_lan.crypto import zero_pad
 from aioayla_lan.device import (
+    READ_SERVES,
     REJECTED_KEY_EXCHANGES,
     RETRY_INTERVAL,
     SESSION_TIMEOUT,
@@ -75,6 +76,29 @@ def _read(name: str, cmd_id: int) -> dict[str, Any]:
 
 def _commands(device: AylaLanDevice, mirror: SessionCrypto) -> dict[str, Any]:
     body: dict[str, Any] = mirror.decrypt_and_validate(device.handle_commands())
+    return body
+
+
+def _answer(
+    device: AylaLanDevice,
+    mirror: SessionCrypto,
+    body: dict[str, Any],
+    status: int = 200,
+) -> None:
+    """Post the module's reply to the read in `body`."""
+    cmd = body["data"]["cmds"][0]["cmd"]
+    name = cmd["resource"].removeprefix("property.json?name=")
+    device.handle_datapoint(
+        mirror.encrypt_and_sign({"seq_no": 0, "data": {"name": name}}),
+        cmd["cmd_id"],
+        status,
+    )
+
+
+def _collect_read(device: AylaLanDevice, mirror: SessionCrypto) -> dict[str, Any]:
+    """Hand out the next read and answer it, as a healthy module does."""
+    body = _commands(device, mirror)
+    _answer(device, mirror, body)
     return body
 
 
@@ -239,7 +263,7 @@ def test_key_exchange_primes_reads_and_reports_connected(
     mirror = device_side(device.handle_key_exchange(key_exchange_request()))
     assert connection_changes == [True]
     assert device.pending
-    assert [_commands(device, mirror)["data"] for _ in PRIME] == [
+    assert [_collect_read(device, mirror)["data"] for _ in PRIME] == [
         _read(name, cmd_id) for cmd_id, name in enumerate(PRIME, start=1)
     ]
     assert not device.pending
@@ -254,10 +278,10 @@ def test_rekey_resets_sequence_and_reads(
 
     second = device_side(device.handle_key_exchange(key_exchange_request()))
 
-    body = _commands(device, second)
+    body = _collect_read(device, second)
     assert body["seq_no"] == 0
     assert body["data"]["cmds"][0]["cmd"]["resource"] == "property.json?name=power"
-    _commands(device, second)
+    _collect_read(device, second)
     assert not device.pending
 
 
@@ -292,7 +316,7 @@ def test_writes_served_before_reads(
         {"base_type": "string", "name": "mode", "value": "cool"},
     ]
     assert [
-        _commands(device, mirror)["data"]["cmds"][0]["cmd"]["resource"]
+        _collect_read(device, mirror)["data"]["cmds"][0]["cmd"]["resource"]
         for _ in range(3)
     ] == [f"property.json?name={name}" for name in (*PRIME, "fan_speed")]
 
@@ -311,7 +335,7 @@ def test_empty_queue_returns_encrypted_empty_command(
     device: AylaLanDevice, mirror: SessionCrypto
 ) -> None:
     for _ in PRIME:
-        _commands(device, mirror)
+        _collect_read(device, mirror)
     payload = device.handle_commands()
     assert set(payload) == {"enc", "sign"}
     assert mirror.decrypt_and_validate(payload) == {
@@ -353,7 +377,7 @@ def test_repeated_read_is_asked_once(
     device.request_properties(["fan_speed", PRIME[0], "fan_speed"])
     device.request_properties(["fan_speed"])
 
-    assert [_commands(device, mirror)["data"] for _ in range(3)] == [
+    assert [_collect_read(device, mirror)["data"] for _ in range(3)] == [
         _read(name, cmd_id)
         for cmd_id, name in enumerate((*PRIME, "fan_speed"), start=1)
     ]
@@ -369,9 +393,79 @@ def test_read_cmd_id_assigned_at_collection(
     device.set_property("power", 1)
 
     assert "properties" in _commands(device, second)["data"]
-    assert [_commands(device, second)["data"] for _ in PRIME] == [
+    assert [_collect_read(device, second)["data"] for _ in PRIME] == [
         _read(name, cmd_id) for cmd_id, name in enumerate(PRIME, start=1)
     ]
+
+
+def test_unanswered_read_served_again_after_writes(
+    device: AylaLanDevice, mirror: SessionCrypto
+) -> None:
+    first = _commands(device, mirror)
+    device.set_property("power", 1)
+
+    assert "properties" in _commands(device, mirror)["data"]
+    assert _commands(device, mirror)["data"] == first["data"] == _read(PRIME[0], 1)
+    assert device.pending
+
+
+def test_unanswered_read_dropped_after_serves(
+    device: AylaLanDevice, mirror: SessionCrypto, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.DEBUG, logger="aioayla_lan")
+    served = [_commands(device, mirror)["data"] for _ in range(READ_SERVES + 1)]
+
+    assert served == [_read(PRIME[0], 1)] * READ_SERVES + [_read(PRIME[1], 2)]
+    assert (
+        f"{DSN}: dropping read of {PRIME[0]} (cmd_id 1), never answered"
+        in caplog.messages
+    )
+
+
+@pytest.mark.parametrize(
+    ("status", "logged"),
+    [
+        pytest.param(200, [], id="ok"),
+        pytest.param(
+            503, [f"{DSN}: read of {PRIME[0]} answered with status 503"], id="failed"
+        ),
+    ],
+)
+def test_answered_read_leaves_queue(
+    device: AylaLanDevice,
+    mirror: SessionCrypto,
+    caplog: pytest.LogCaptureFixture,
+    status: int,
+    logged: list[str],
+) -> None:
+    body = _commands(device, mirror)
+    caplog.set_level(logging.DEBUG, logger="aioayla_lan")
+
+    _answer(device, mirror, body, status)
+
+    assert caplog.messages == logged
+    assert _commands(device, mirror)["data"] == _read(PRIME[1], 2)
+
+
+@pytest.mark.parametrize(
+    "cmd_id", [pytest.param(None, id="push"), pytest.param(99, id="unknown-cmd-id")]
+)
+def test_datapoint_without_matching_cmd_id_keeps_read(
+    device: AylaLanDevice, mirror: SessionCrypto, cmd_id: int | None
+) -> None:
+    body = _commands(device, mirror)
+    device.handle_datapoint(
+        mirror.encrypt_and_sign({"seq_no": 0, "data": {"name": PRIME[0]}}), cmd_id, 200
+    )
+    assert _commands(device, mirror)["data"] == body["data"]
+
+
+def test_undecodable_answer_leaves_queue(
+    device: AylaLanDevice, mirror: SessionCrypto
+) -> None:
+    cmd_id = _commands(device, mirror)["data"]["cmds"][0]["cmd"]["cmd_id"]
+    device.handle_datapoint(_sign_raw(mirror, b'{"seq_no":0,"data":{}'), cmd_id, 200)
+    assert _commands(device, mirror)["data"] == _read(PRIME[1], 2)
 
 
 def test_pending_since_tracks_busy_queue(clock: _Clock, device: AylaLanDevice) -> None:
@@ -382,8 +476,9 @@ def test_pending_since_tracks_busy_queue(clock: _Clock, device: AylaLanDevice) -
     clock.now += 5
     device.set_property("power", 1)
     assert device.pending_since == START
-    for _ in range(1 + len(PRIME)):
-        _commands(device, mirror)
+    _written(device, mirror)
+    for _ in PRIME:
+        _collect_read(device, mirror)
     assert device.pending_since is None
 
     clock.now += 5
@@ -648,7 +743,7 @@ def test_commands_log_cmd_id_and_seq(
 
     write_id = _written(device, mirror)["id"]
     for _ in PRIME:
-        _commands(device, mirror)
+        _collect_read(device, mirror)
 
     # The write takes seq 0 but no cmd_id, so the two counters differ.
     assert caplog.messages == [
@@ -1055,6 +1150,45 @@ async def test_run_follows_module_through_queue_without_reregistering(
 
     await asyncio.sleep(0.25)
     assert fake_http.calls.empty()
+
+
+async def test_run_drained_once_last_read_answered(
+    runner: Callable[[], AylaLanDevice],
+    fake_http: _FakeHttp,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("aioayla_lan.device.NOTIFY_TIMEOUT", 0.2)
+    device = runner()
+    await fake_http.next_call()
+    mirror = device_side(device.handle_key_exchange(key_exchange_request()))
+    device.request_properties(["fan_speed"])
+
+    await fake_http.next_call()
+    body = _commands(device, mirror)
+    await asyncio.sleep(0.15)
+    # The fetch restarted the timer; the answer ends the drain.
+    _answer(device, mirror, body)
+
+    await asyncio.sleep(0.25)
+    assert fake_http.calls.empty()
+
+
+async def test_run_notifies_again_while_read_unanswered(
+    runner: Callable[[], AylaLanDevice],
+    fake_http: _FakeHttp,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("aioayla_lan.device.NOTIFY_TIMEOUT", 0.05)
+    device = runner()
+    await fake_http.next_call()
+    mirror = device_side(device.handle_key_exchange(key_exchange_request()))
+    device.request_properties(["fan_speed"])
+
+    await fake_http.next_call()
+    _commands(device, mirror)
+
+    renotify = await fake_http.next_call()
+    assert (renotify.method, renotify.notify) == ("PUT", 1)
 
 
 async def test_run_notifies_again_when_module_stalls(
