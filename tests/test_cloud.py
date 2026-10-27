@@ -195,6 +195,24 @@ async def test_list_devices(signed_in: AylaCloud, http: _FakeHttp) -> None:
     ]
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param({"device": {"dsn": DSN}}, id="object"),
+        pytest.param(None, id="null"),
+        pytest.param(["device"], id="entry-not-an-object"),
+        pytest.param([{"device": "AC000W000000002"}], id="device-not-an-object"),
+        pytest.param([{"device": {"product_name": "Living room"}}], id="no-dsn"),
+    ],
+)
+async def test_list_devices_malformed_reply(
+    signed_in: AylaCloud, http: _FakeHttp, payload: object
+) -> None:
+    http.replies[("GET", DEVICES_URL)] = _Reply(payload=payload)
+    with pytest.raises(CloudError, match="malformed device list"):
+        await signed_in.list_devices()
+
+
 async def test_get_lan_key(signed_in: AylaCloud, http: _FakeHttp) -> None:
     http.replies[("GET", LAN_URL)] = _Reply(
         payload={"lanip": {"lanip_key": "secret-key", "lanip_key_id": 42}}

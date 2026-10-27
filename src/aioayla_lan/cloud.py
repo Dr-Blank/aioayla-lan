@@ -93,16 +93,20 @@ class AylaCloud:
 
     async def list_devices(self) -> list[CloudDevice]:
         """List devices on the account."""
-        return [
-            CloudDevice(
-                dsn=dev["dsn"],
-                product_name=dev.get("product_name"),
-                lan_ip=dev.get("lan_ip"),
-                lan_enabled=bool(dev.get("lan_enabled")),
-            )
-            for entry in await self._get("/apiv1/devices.json")
-            if (dev := entry.get("device"))
-        ]
+        reply = await self._get("/apiv1/devices.json")
+        try:
+            return [
+                CloudDevice(
+                    dsn=dev["dsn"],
+                    product_name=dev.get("product_name"),
+                    lan_ip=dev.get("lan_ip"),
+                    lan_enabled=bool(dev.get("lan_enabled")),
+                )
+                for entry in reply
+                if (dev := entry.get("device"))
+            ]
+        except (AttributeError, KeyError, TypeError) as err:
+            raise CloudError("malformed device list") from err
 
     async def get_lan_key(self, dsn: str) -> LanKey:
         """Fetch the LAN key for one device."""
